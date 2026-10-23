@@ -1,337 +1,453 @@
 #include <Geode/Geode.hpp>
+#include <Geode/modify/EffectGameObject.hpp>
+#include <Geode/modify/GameObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/HardStreak.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
-
 #include <algorithm>
-#include <chrono>
-#include <cstdint>
-#include <deque>
+#include <array>
+#include <cmath>
 
 using namespace geode::prelude;
 
-namespace pib {
-	using Clock = std::chrono::steady_clock;
+namespace {
+    constexpr int kJumpButton = 1;
+    constexpr float kFallbackDelta = 1.f / 240.f;
+    constexpr int kCubeHorizon = 48;
+    constexpr int kWaveHorizon = 38;
+    constexpr int kMiniWaveHorizon = 28;
 
-	struct Pending {
-		int64_t fireAt;
-		bool down;
-	};
+    struct PendingInput {
+        bool active = false;
+        int ticksRemaining = 0;
+        bool state = false;
+        bool oppositeQueued = false;
+        bool isPlayer1 = true;
+        int button = kJumpButton;
+    };
 
-	// Survives: ran the whole lookahead alive.
-	// Dies:     clone crashed.
-	// Special:  clone reached a portal/orb/pad/trigger alive (can't simulate past it).
-	// Timeout:  ran out of time budget, result unknown.
-	enum class Outcome { Survives, Dies, Special, Timeout };
+    struct SimulationResult {
+        int survived = 0;
+        bool diedBeforeInput = false;
+        bool supported = true;
+    };
 
-	inline std::deque<Pending> g_queue;
-	inline PlayerObject* g_clone = nullptr;
-	inline GJBaseGameLayer* g_cloneLayer = nullptr;
-	inline int64_t g_updates = 0;   // physics updates of the real player so far
-	inline int64_t g_shift = 0;     // delay applied to the latest click (keeps rhythm)
-	inline float g_dt = 1.f / 240.f;
-	inline bool g_bypass = false;   // delivering a queued click
-	inline bool g_simulating = false;
-	inline bool g_cloneDied = false;
-	inline bool g_cloneTouchedSpecial = false;
+    std::array<PendingInput, 2> g_pending{};
+    PlayerObject* g_ghost = nullptr;
+    bool g_simulating = false;
+    bool g_ghostDied = false;
+    bool g_injecting = false;
+    float g_frameDelta = kFallbackDelta;
 
-	inline bool enabled() {
-		return Mod::get()->getSettingValue<bool>("enabled");
-	}
-	inline int64_t maxDelayTicks() {
-		return Mod::get()->getSettingValue<int64_t>("max-delay-frames") * 4;
-	}
-	inline int64_t lookahead() {
-		return Mod::get()->getSettingValue<int64_t>("lookahead-ticks");
-	}
-	inline int64_t holdTicks() {
-		return std::max<int64_t>(1, Mod::get()->getSettingValue<int64_t>("hold-ticks"));
-	}
-	inline int64_t budgetMs() {
-		return Mod::get()->getSettingValue<int64_t>("time-budget-ms");
-	}
-	inline bool waveRelease() {
-		return Mod::get()->getSettingValue<bool>("wave-release");
-	}
-	inline bool practiceOnly() {
-		return Mod::get()->getSettingValue<bool>("practice-only");
-	}
+    bool isEnabled() {
+        return Mod::get()->getSettingValue<bool>("enabled");
+    }
 
-	inline bool isClone(PlayerObject* p) {
-		return p != nullptr && p == g_clone;
-	}
+    int getMaxDelay() {
+        return std::clamp(Mod::get()->getSettingValue<int>("max-delay-frames"), 1, 8);
+    }
 
-	inline void resetRuntime() {
-		g_queue.clear();
-		g_updates = 0;
-		g_shift = 0;
-		g_bypass = false;
-		g_simulating = false;
-		g_cloneDied = false;
-		g_cloneTouchedSpecial = false;
-	}
+    bool isSupportedPlayer(PlayerObject* player, PlayLayer* layer, bool isPlayer1) {
+        return player
+            && layer
+            && isPlayer1
+            && !layer->m_gameState.m_isDualMode
+            && !player->m_isDead
+            && !player->m_isShip
+            && !player->m_isPlatformer
+            && !player->m_isDashing;
+    }
 
-	inline void releaseClone() {
-		if (g_clone) {
-			g_clone->release();
-			g_clone = nullptr;
-		}
-		g_cloneLayer = nullptr;
-	}
+    bool isFlying(PlayerObject* player) {
+        return player && (player->m_isDart || player->m_isBird || player->m_isSwing);
+    }
 
-	// The clone is tied to the layer it was created for; rebuild it if the layer changed.
-	inline bool ensureClone(GJBaseGameLayer* layer) {
-		if (g_clone && g_cloneLayer == layer) return true;
-		releaseClone();
-		g_clone = PlayerObject::create(1, 1, layer, layer, false);
-		if (!g_clone) return false;
-		g_clone->retain();
-		g_clone->setVisible(false);
-		g_cloneLayer = layer;
-		return true;
-	}
+    bool isCollisionRelevant(GameObject* object) {
+        if (!object || object->m_isDisabled || object->m_isDisabled2) return false;
+        auto type = static_cast<unsigned>(object->m_objectType);
+        return type == static_cast<unsigned>(GameObjectType::Solid)
+            || type == static_cast<unsigned>(GameObjectType::Hazard)
+            || type == static_cast<unsigned>(GameObjectType::Slope)
+            || type == static_cast<unsigned>(GameObjectType::CollisionObject)
+            || type == static_cast<unsigned>(GameObjectType::AnimatedHazard);
+    }
 
-	// Only single-player, non-platformer play is predicted.
-	inline bool active(PlayLayer* pl) {
-		if (!enabled() || !pl || !pl->m_player1) return false;
-		if (maxDelayTicks() <= 0) return false;
-		if (practiceOnly() && !pl->m_isPracticeMode) return false;
-		if (pl->m_player1->m_isPlatformer) return false;
-		if (pl->m_player2 && pl->m_player2->isVisible()) return false;
-		return true;
-	}
+    PendingInput* pendingFor(bool isPlayer1) {
+        return &g_pending[isPlayer1 ? 0u : 1u];
+    }
 
-	inline void flush(PlayLayer* pl) {
-		while (!g_queue.empty()) {
-			auto e = g_queue.front();
-			g_queue.pop_front();
-			g_bypass = true;
-			pl->handleButton(e.down, 1, true);
-			g_bypass = false;
-		}
-	}
+    void resetPending() {
+        for (auto& input : g_pending) input = PendingInput{};
+    }
 
-	// Copy the real player's physics state onto the hidden clone.
-	inline void syncClone(PlayerObject* real) {
-		auto* c = g_clone;
-		c->copyAttributes(real);
-		c->setPosition(real->getPosition());
-		c->m_position = real->m_position;
-		c->setScaleX(real->getScaleX());
-		c->setScaleY(real->getScaleY());
-		c->setRotation(real->getRotation());
-		c->m_yVelocity = real->m_yVelocity;
-		c->m_isOnGround = real->m_isOnGround;
-		c->m_isUpsideDown = real->m_isUpsideDown;
-		c->m_isSideways = real->m_isSideways;
-		c->m_gravityMod = real->m_gravityMod;
-		c->m_playerSpeed = real->m_playerSpeed;
-		c->m_vehicleSize = real->m_vehicleSize;
-		c->m_isShip = real->m_isShip;
-		c->m_isBird = real->m_isBird;
-		c->m_isBall = real->m_isBall;
-		c->m_isDart = real->m_isDart;
-		c->m_isRobot = real->m_isRobot;
-		c->m_isSpider = real->m_isSpider;
-		c->m_isSwing = real->m_isSwing;
-		c->m_isDead = false;
-		c->releaseAllButtons();
-	}
+    void setGhostButton(PlayerObject* ghost, bool down) {
+        if (down) ghost->pushButton(PlayerButton::Jump);
+        else ghost->releaseButton(PlayerButton::Jump);
+    }
 
-	// Run the clone forward. Press event: click at tick `delay`, hold briefly, release.
-	// Release event: button starts held, released at tick `delay`.
-	inline Outcome simulate(
-		GJBaseGameLayer* layer, PlayerObject* real, int64_t delay,
-		bool pressEvent, Clock::time_point deadline
-	) {
-		syncClone(real);
-		g_cloneDied = false;
-		g_cloneTouchedSpecial = false;
-		g_simulating = true;
+    void copyPlayerState(PlayerObject* ghost, PlayerObject* real) {
+        ghost->copyAttributes(real);
+        ghost->setPosition(real->getPosition());
+        ghost->setScale(real->getScale());
+        ghost->setContentSize(real->getContentSize());
+        ghost->m_width = real->m_width;
+        ghost->m_height = real->m_height;
+        ghost->m_gravityMod = real->m_gravityMod;
+        ghost->m_isOnGround = real->m_isOnGround;
+        ghost->m_isUpsideDown = real->m_isUpsideDown;
+        ghost->m_vehicleSize = real->m_vehicleSize;
+        ghost->m_playerSpeed = real->m_playerSpeed;
+        ghost->m_isDead = false;
+        ghost->setVisible(false);
+        ghost->m_playEffects = false;
+        ghost->m_hasGroundParticles = false;
+        ghost->m_hasShipParticles = false;
+        ghost->removeAllParticles();
+        ghost->releaseAllButtons();
+        ghost->resetCollisionLog(true);
+    }
 
-		if (!pressEvent) g_clone->pushButton(PlayerButton::Jump);
+    void advanceGhost(PlayerObject* ghost, float dt) {
+        ghost->update(dt);
+        ghost->updateRotation(dt);
+    }
 
-		int64_t hold = holdTicks();
-		int64_t total = delay + lookahead();
-		Outcome result = Outcome::Survives;
+    void checkGhost(PlayLayer* layer, PlayerObject* ghost, float dt) {
+        ghost->resetCollisionLog(true);
+        layer->checkCollisions(ghost, dt, false);
+    }
 
-		for (int64_t t = 0; t < total; ++t) {
-			if (pressEvent) {
-				if (t == delay) g_clone->pushButton(PlayerButton::Jump);
-				else if (t == delay + hold) g_clone->releaseButton(PlayerButton::Jump);
-			} else if (t == delay) {
-				g_clone->releaseButton(PlayerButton::Jump);
-			}
+    // Returns how many simulation updates the player survives after the
+    // requested transition. For delay > 0, the opposite button state is held
+    // until the exact candidate frame, then the requested state remains held.
+    SimulationResult simulate(PlayLayer* layer, PlayerObject* real, bool down, int delay, int horizon) {
+        SimulationResult result;
+        if (!layer || !real || !g_ghost || g_ghost == real) {
+            result.supported = false;
+            return result;
+        }
 
-			g_clone->update(g_dt);
-			layer->checkCollisions(g_clone, g_dt, false);
+        float dt = g_frameDelta;
+        if (!std::isfinite(dt) || dt <= 0.f || dt > 0.05f) dt = kFallbackDelta;
 
-			if (g_cloneDied) { result = Outcome::Dies; break; }
-			if (g_cloneTouchedSpecial) { result = Outcome::Special; break; }
-			if ((t & 15) == 15 && Clock::now() > deadline) { result = Outcome::Timeout; break; }
-		}
+        copyPlayerState(g_ghost, real);
+        g_ghostDied = false;
+        g_simulating = true;
 
-		g_simulating = false;
-		g_clone->releaseAllButtons();
-		return result;
-	}
+        if (delay > 0) {
+            setGhostButton(g_ghost, !down);
+        }
+        else {
+            // The zero-delay baseline must include the requested input. Without
+            // this, it only simulates the current trajectory and treats most
+            // dangerous inputs as safe, so the candidate search never runs.
+            setGhostButton(g_ghost, down);
+        }
 
-	// 0 = leave the input alone; otherwise the earliest delay (in ticks) that survives.
-	inline int64_t chooseDelay(GJBaseGameLayer* layer, PlayerObject* real, bool pressEvent) {
-		if (!ensureClone(layer)) return 0;
-		auto deadline = Clock::now() + std::chrono::milliseconds(budgetMs());
+        const int total = delay + horizon;
+        int airTicks = 0;
+        int groundTicks = 0;
+        bool flying = isFlying(real);
 
-		// Only intervene if the unmodified input is known to kill.
-		if (simulate(layer, real, 0, pressEvent, deadline) != Outcome::Dies) return 0;
+        for (int tick = 0; tick < total; ++tick) {
+            if (tick == delay) setGhostButton(g_ghost, down);
 
-		int64_t maxTicks = maxDelayTicks();
-		for (int64_t d = 1; d <= maxTicks; ++d) {
-			if (Clock::now() > deadline) return 0;
-			auto r = simulate(layer, real, d, pressEvent, deadline);
-			if (r == Outcome::Timeout) return 0;
-			// Reaching a special object alive still beats a delay-0 death.
-			if (r == Outcome::Survives || r == Outcome::Special) return d;
-		}
-		return 0;
-	}
+            advanceGhost(g_ghost, dt);
+            if (g_ghostDied || g_ghost->m_isDead) {
+                result.diedBeforeInput = tick < delay;
+                break;
+            }
+
+            checkGhost(layer, g_ghost, dt);
+            if (g_ghostDied || g_ghost->m_isDead) {
+                result.diedBeforeInput = tick < delay;
+                break;
+            }
+
+            if (tick < delay) continue;
+            ++result.survived;
+
+            if (flying) continue;
+            if (!g_ghost->m_isOnGround) {
+                ++airTicks;
+                groundTicks = 0;
+                continue;
+            }
+            if (airTicks < 6) continue;
+            if (groundTicks > 2) {
+                result.survived = horizon;
+                break;
+            }
+            ++groundTicks;
+        }
+
+        g_simulating = false;
+        return result;
+    }
+
+    // Search only the user's configured 1–8 update window. A delay is selected
+    // only when the no-delay path dies sooner and the delayed path survives a
+    // meaningful additional section; otherwise the original input passes now.
+    int findSafeDelay(PlayLayer* layer, PlayerObject* player, bool down) {
+        bool wave = player->m_isDart;
+        bool miniWave = wave && player->m_vehicleSize < 1.f;
+        const int horizon = miniWave ? kMiniWaveHorizon : (wave ? kWaveHorizon : kCubeHorizon);
+
+        auto immediate = simulate(layer, player, down, 0, horizon);
+        if (!immediate.supported || immediate.survived >= horizon) return 0;
+
+        const int maxDelay = getMaxDelay();
+        if (!wave) {
+            const int target = std::min(horizon, immediate.survived + 12);
+            for (int delay = 1; delay <= maxDelay; ++delay) {
+                auto candidate = simulate(layer, player, down, delay, horizon);
+                if (!candidate.supported || candidate.diedBeforeInput) break;
+                if (candidate.survived >= target) return delay;
+            }
+        }
+        else {
+            int target = immediate.survived + 10;
+            int gain = 6;
+            for (int delay = 1; delay <= maxDelay; ++delay) {
+                auto candidate = simulate(layer, player, down, delay, horizon);
+                if (!candidate.supported || candidate.diedBeforeInput) break;
+                bool safeImprovement = candidate.survived < horizon
+                    ? candidate.survived >= target
+                    : (candidate.survived - immediate.survived >= gain || candidate.survived >= target);
+                if (safeImprovement) return delay;
+                target += 2;
+                gain += 2;
+            }
+        }
+        return 0;
+    }
+
+    void sendButton(GJBaseGameLayer* layer, bool down, bool isPlayer1, int button) {
+        if (!layer) return;
+        g_injecting = true;
+        layer->handleButton(down, button, isPlayer1);
+        g_injecting = false;
+    }
+
+    void flushOne(GJBaseGameLayer* layer, PendingInput& input) {
+        if (!input.active) return;
+        bool sendOppositeNext = input.oppositeQueued;
+        bool nextState = !input.state;
+        input.active = false;
+        input.oppositeQueued = false;
+        sendButton(layer, input.state, input.isPlayer1, input.button);
+        if (sendOppositeNext) {
+            input.active = true;
+            input.ticksRemaining = 1;
+            input.state = nextState;
+        }
+    }
+
+    void flushAll(GJBaseGameLayer* layer) {
+        for (auto& input : g_pending) flushOne(layer, input);
+    }
+
+    bool interceptInput(GJBaseGameLayer* self, bool down, int button, bool isPlayer1) {
+        if (!isEnabled() || button != kJumpButton || !isPlayer1) return false;
+
+        auto* pending = pendingFor(isPlayer1);
+        if (pending->active) {
+            pending->oppositeQueued = pending->state != down;
+            return true;
+        }
+
+        auto* layer = PlayLayer::get();
+        auto* player = self->m_player1;
+        if (!layer || static_cast<GJBaseGameLayer*>(layer) != self
+            || !isSupportedPlayer(player, layer, isPlayer1)) {
+            return false;
+        }
+
+        // Cube releases do not create a new jump; robot and wave releases do
+        // change the trajectory and are therefore tested like presses.
+        if (!down && !player->m_isRobot && !player->m_isDart) return false;
+
+        const int delay = findSafeDelay(layer, player, down);
+        if (delay <= 0) return false;
+
+        pending->active = true;
+        pending->ticksRemaining = delay;
+        pending->state = down;
+        pending->oppositeQueued = false;
+        pending->isPlayer1 = isPlayer1;
+        pending->button = button;
+        return true;
+    }
 }
 
-class $modify(PIBGameLayer, GJBaseGameLayer) {
-	void handleButton(bool down, int button, bool isPlayer1) {
-		auto* self = static_cast<GJBaseGameLayer*>(this);
-		auto* pl = PlayLayer::get();
-		bool inPlay = pl && static_cast<GJBaseGameLayer*>(pl) == self;
+class $modify(PredictiveInputBufferPlayLayer, PlayLayer) {
+    void setupHasCompleted() {
+        PlayLayer::setupHasCompleted();
+        if (g_ghost && g_ghost->getParent()) g_ghost->removeFromParentAndCleanup(true);
+        g_ghost = nullptr;
+        if (m_objectLayer) {
+            g_ghost = PlayerObject::create(1, 1, this, this, true);
+            if (g_ghost) {
+                g_ghost->setVisible(false);
+                g_ghost->m_playEffects = false;
+                g_ghost->m_hasGroundParticles = false;
+                g_ghost->m_hasShipParticles = false;
+                m_objectLayer->addChild(g_ghost);
+            }
+        }
+        resetPending();
+    }
 
-		if (pib::g_bypass || pib::g_simulating || !inPlay || button != 1 || !isPlayer1) {
-			GJBaseGameLayer::handleButton(down, button, isPlayer1);
-			return;
-		}
+    void resetLevel() {
+        resetPending();
+        PlayLayer::resetLevel();
+    }
 
-		if (!pib::active(pl)) {
-			pib::flush(pl);
-			GJBaseGameLayer::handleButton(down, button, isPlayer1);
-			return;
-		}
+    void onQuit() {
+        auto* ghost = g_ghost;
+        g_ghost = nullptr;
+        resetPending();
+        if (ghost && ghost->getParent()) ghost->removeFromParentAndCleanup(true);
+        PlayLayer::onQuit();
+    }
 
-		auto* player = pl->m_player1;
-		int64_t delay = 0;
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
+        if (g_simulating && player == g_ghost) {
+            g_ghostDied = true;
+            player->m_isDead = true;
+            return;
+        }
+        if (player == m_player1) resetPending();
+        PlayLayer::destroyPlayer(player, object);
+    }
 
-		if (!pib::g_queue.empty()) {
-			delay = pib::g_shift;                       // something is waiting: keep the rhythm
-		} else if (down) {
-			delay = pib::chooseDelay(self, player, true);
-			pib::g_shift = delay;
-		} else if (player->m_isDart && pib::waveRelease()) {
-			delay = pib::chooseDelay(self, player, false);
-			pib::g_shift = delay;
-		} else {
-			delay = pib::g_shift;                       // keep the hold length of a delayed press
-		}
-
-		if (delay <= 0 && pib::g_queue.empty()) {
-			GJBaseGameLayer::handleButton(down, button, isPlayer1);
-			return;
-		}
-
-		int64_t fire = pib::g_updates + delay;
-		if (!pib::g_queue.empty()) fire = std::max(fire, pib::g_queue.back().fireAt + 1);
-		pib::g_queue.push_back({fire, down});
-	}
-
-	// Things the hidden clone must never do to the real level.
-	bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
-		if (pib::isClone(player)) { pib::g_cloneTouchedSpecial = true; return false; }
-		return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
-	}
-	void playerTouchedRing(PlayerObject* player, RingObject* object) {
-		if (pib::isClone(player)) { pib::g_cloneTouchedSpecial = true; return; }
-		GJBaseGameLayer::playerTouchedRing(player, object);
-	}
-	void playerTouchedTrigger(PlayerObject* player, EffectGameObject* object) {
-		if (pib::isClone(player)) { pib::g_cloneTouchedSpecial = true; return; }
-		GJBaseGameLayer::playerTouchedTrigger(player, object);
-	}
-	void bumpPlayer(PlayerObject* player, EffectGameObject* object) {
-		if (pib::isClone(player)) { pib::g_cloneTouchedSpecial = true; return; }
-		GJBaseGameLayer::bumpPlayer(player, object);
-	}
-	void gravBumpPlayer(PlayerObject* player, EffectGameObject* object) {
-		if (pib::isClone(player)) { pib::g_cloneTouchedSpecial = true; return; }
-		GJBaseGameLayer::gravBumpPlayer(player, object);
-	}
-	void destroyObject(GameObject* object) {
-		if (pib::g_simulating) { pib::g_cloneTouchedSpecial = true; return; }
-		GJBaseGameLayer::destroyObject(object);
-	}
-	void pickupItem(EffectGameObject* object) {
-		if (pib::g_simulating) { pib::g_cloneTouchedSpecial = true; return; }
-		GJBaseGameLayer::pickupItem(object);
-	}
-	void collectedObject(EffectGameObject* object) {
-		if (pib::g_simulating) { pib::g_cloneTouchedSpecial = true; return; }
-		GJBaseGameLayer::collectedObject(object);
-	}
-	void gameEventTriggered(GJGameEvent event, int material, int playerID) {
-		if (pib::g_simulating) return;
-		GJBaseGameLayer::gameEventTriggered(event, material, playerID);
-	}
+    void playEndAnimationToPos(cocos2d::CCPoint position) {
+        if (!g_simulating) PlayLayer::playEndAnimationToPos(position);
+    }
 };
 
-class $modify(PIBPlayer, PlayerObject) {
-	void update(float dt) {
-		auto* pl = PlayLayer::get();
-		PlayerObject* self = this;
-		if (pl && self == pl->m_player1 && !pib::isClone(self)) {
-			if (dt > 0.f) pib::g_dt = dt;
+class $modify(PredictiveInputBufferGameLayer, GJBaseGameLayer) {
+    void handleButton(bool down, int button, bool isPlayer1) {
+        if (g_simulating || g_injecting) {
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            return;
+        }
 
-			// deliver delayed clicks at the start of their tick
-			while (!pib::g_queue.empty() && pib::g_queue.front().fireAt <= pib::g_updates) {
-				auto e = pib::g_queue.front();
-				pib::g_queue.pop_front();
-				pib::g_bypass = true;
-				pl->handleButton(e.down, 1, true);
-				pib::g_bypass = false;
-			}
+        if (!isEnabled()) {
+            flushAll(this);
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            return;
+        }
 
-			PlayerObject::update(dt);
-			pib::g_updates++;
-			return;
-		}
-		PlayerObject::update(dt);
-	}
+        if (interceptInput(this, down, button, isPlayer1)) return;
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
 
-	void tryPlaceCheckpoint() {
-		if (pib::isClone(this)) return;
-		PlayerObject::tryPlaceCheckpoint();
-	}
+    void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects, int objectCount, float dt) {
+        if (!g_simulating || player != g_ghost) {
+            GJBaseGameLayer::collisionCheckObjects(player, objects, objectCount, dt);
+            return;
+        }
 
-	void incrementJumps() {
-		if (pib::isClone(this)) return;
-		PlayerObject::incrementJumps();
-	}
+        if (!objects) return;
+        static gd::vector<GameObject*> relevant;
+        relevant.clear();
+        int limit = std::clamp(objectCount, 0, static_cast<int>(objects->size()));
+        if (static_cast<int>(relevant.capacity()) < limit) relevant.reserve(static_cast<size_t>(limit));
+        for (int index = 0; index < limit; ++index) {
+            auto* object = (*objects)[static_cast<size_t>(index)];
+            if (isCollisionRelevant(object)) relevant.push_back(object);
+        }
+        GJBaseGameLayer::collisionCheckObjects(player, &relevant, static_cast<int>(relevant.size()), dt);
+    }
+
+    bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
+        if (g_simulating) return false;
+        return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
+    }
+
+    void playerTouchedRing(PlayerObject* player, RingObject* object) {
+        if (g_simulating) return;
+        GJBaseGameLayer::playerTouchedRing(player, object);
+    }
+
+    void playerTouchedTrigger(PlayerObject* player, EffectGameObject* object) {
+        if (g_simulating) return;
+        GJBaseGameLayer::playerTouchedTrigger(player, object);
+    }
+
+    void activateSFXTrigger(SFXTriggerGameObject* object) {
+        if (!g_simulating) GJBaseGameLayer::activateSFXTrigger(object);
+    }
+
+    void activateSongEditTrigger(SongTriggerGameObject* object) {
+        if (!g_simulating) GJBaseGameLayer::activateSongEditTrigger(object);
+    }
+
+    void gameEventTriggered(GJGameEvent event, int material, int playerID) {
+        if (!g_simulating) GJBaseGameLayer::gameEventTriggered(event, material, playerID);
+    }
 };
 
-class $modify(PIBPlayLayer, PlayLayer) {
-	void resetLevel() {
-		pib::resetRuntime();
-		PlayLayer::resetLevel();
-	}
+class $modify(PredictiveInputBufferEffectObject, EffectGameObject) {
+    void triggerObject(GJBaseGameLayer* layer, int id, gd::vector<int> const* groups) {
+        if (!g_simulating) EffectGameObject::triggerObject(layer, id, groups);
+    }
+};
 
-	void onQuit() {
-		pib::resetRuntime();
-		pib::releaseClone();
-		PlayLayer::onQuit();
-	}
+class $modify(PredictiveInputBufferGameObject, GameObject) {
+    void playShineEffect() {
+        if (!g_simulating) GameObject::playShineEffect();
+    }
+};
 
-	void destroyPlayer(PlayerObject* player, GameObject* object) {
-		if (pib::isClone(player)) {
-			pib::g_cloneDied = true;   // the clone crashed: record it, never run the real death
-			return;
-		}
-		PlayLayer::destroyPlayer(player, object);
-	}
+class $modify(PredictiveInputBufferHardStreak, HardStreak) {
+    void addPoint(cocos2d::CCPoint point) {
+        if (!g_simulating) HardStreak::addPoint(point);
+    }
+};
+
+class $modify(PredictiveInputBufferPlayerObject, PlayerObject) {
+    void update(float dt) {
+        if (!g_simulating) {
+            auto* layer = PlayLayer::get();
+            if (layer && this == layer->m_player1 && std::isfinite(dt) && dt > 0.f) {
+                float warp = layer->m_gameState.m_timeWarp;
+                g_frameDelta = warp > 0.f ? dt / warp : dt;
+            }
+            if (layer && this == layer->m_player1) {
+                if (!isEnabled()) {
+                    flushAll(layer);
+                }
+                else {
+                    for (auto& input : g_pending) {
+                        if (!input.active) continue;
+                        if (input.ticksRemaining > 0) --input.ticksRemaining;
+                        if (input.ticksRemaining <= 0) flushOne(layer, input);
+                    }
+                }
+            }
+        }
+        PlayerObject::update(dt);
+    }
+
+    void incrementJumps() {
+        if (!g_simulating) PlayerObject::incrementJumps();
+    }
+
+    void playSpiderDashEffect(cocos2d::CCPoint from, cocos2d::CCPoint to) {
+        if (!g_simulating) PlayerObject::playSpiderDashEffect(from, to);
+    }
+
+    void ringJump(RingObject* ring, bool skipCheck) {
+        if (!g_simulating) PlayerObject::ringJump(ring, skipCheck);
+    }
 };
 
 $on_mod(Loaded) {
-	log::info("Predictive Input Buffer loaded");
+    log::info(
+        "[PredictiveInputBuffer] Loaded. Enabled: {}; maximum candidate delay: {} updates.",
+        isEnabled(), getMaxDelay()
+    );
 }
