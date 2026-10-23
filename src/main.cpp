@@ -122,7 +122,7 @@ namespace pib {
 		if (maxDelayTicks() <= 0) return "max delay is 0";
 		if (practiceOnly() && !pl->m_isPracticeMode) return "practice-only is on";
 		if (pl->m_player1->m_isPlatformer) return "platformer level";
-		if (pl->m_player2 && pl->m_player2->isVisible()) return "dual mode";
+		if (pl->m_gameState.m_isDualMode) return "dual mode";
 		return nullptr;
 	}
 
@@ -246,7 +246,7 @@ class $modify(PIBMenu, MenuLayer) {
 	bool init() {
 		if (!MenuLayer::init()) return false;
 		auto size = CCDirector::sharedDirector()->getWinSize();
-		auto* label = CCLabelBMFont::create("PIB v0.5.1 loaded", "bigFont.fnt");
+		auto* label = CCLabelBMFont::create("PIB v0.5.2 loaded", "bigFont.fnt");
 		label->setScale(0.4f);
 		label->setPosition({ size.width / 2.f, 12.f });
 		label->setZOrder(100);
