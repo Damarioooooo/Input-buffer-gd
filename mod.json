@@ -1,28 +1,28 @@
 {
-  "geode": "5.11.2",
-  "gd": {
-    "win": "2.2081",
-    "ios": "2.2081"
-  },
-  "id": "cesar.input-buffer",
-  "name": "Predictive Input Buffer",
-  "version": "v0.4.2",
-  "developer": "CesarGD96",
-  "description": "Trajectory-based 1–8 update input safety buffer inspired by the attached reference mod.",
-  "settings": {
-    "enabled": {
-      "type": "bool",
-      "default": true,
-      "name": "Enable Predictive Buffer",
-      "description": "Turn predictive input delaying on or off without restarting. Turning it off immediately flushes queued input."
-    },
-    "max-delay-frames": {
-      "type": "int",
-      "default": 2,
-      "min": 1,
-      "max": 8,
-      "name": "Maximum Delay (frames)",
-      "description": "Search for the earliest safe input frame within this many game updates. If no safe candidate is found in this window, the original input passes through."
-    }
-  }
+	"geode": "5.11.2",
+	"gd": {
+		"win": "2.2081",
+		"ios": "2.2081"
+	},
+	"id": "cesar.input-buffer",
+	"name": "Predictive Input Buffer",
+	"version": "v0.4.2",
+	"developer": "CesarGD96",
+	"description": "Trajectory-based 1–8 update input safety buffer inspired by the attached reference mod.",
+	"settings": {
+		"enabled": {
+			"type": "bool",
+			"default": true,
+			"name": "Enable Predictive Buffer",
+			"description": "Turn predictive input delaying on or off without restarting. Turning it off immediately flushes queued input."
+		},
+		"max-delay-frames": {
+			"type": "int",
+			"default": 2,
+			"min": 1,
+			"max": 8,
+			"name": "Maximum Delay (frames)",
+			"description": "Search for the earliest safe input frame within this many game updates. If no safe candidate is found in this window, the original input passes through."
+		}
+	}
 }
