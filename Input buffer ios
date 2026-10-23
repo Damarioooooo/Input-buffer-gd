@@ -1,0 +1,42 @@
+{
+	"geode": "v4.10.0",
+	"gd": {
+		"win": "2.2074",
+		"android": "2.2074",
+		"mac": "2.2074",
+		"ios": "2.2074"
+	},
+	"version": "v1.0.0",
+	"id": "yourname.input-buffer",
+	"name": "Input Buffer",
+	"developer": "YourName",
+	"description": "Delays your clicks by a set number of ticks so early inputs still land.",
+	"tags": ["enhancement"],
+	"settings": {
+		"enabled": {
+			"type": "bool",
+			"name": "Enabled",
+			"description": "Turn the input buffer on or off.",
+			"default": true
+		},
+		"delay-ticks": {
+			"type": "int",
+			"name": "Buffer (ticks)",
+			"description": "How many physics ticks each click waits before it is actually input. GD runs at 240 ticks per second by default, so 1 tick is about 4.2 ms and 12 ticks is about 50 ms. 0 = no delay.",
+			"default": 3,
+			"min": 0,
+			"max": 60,
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"input": true
+			}
+		},
+		"affect-movement": {
+			"type": "bool",
+			"name": "Also buffer left/right (platformer)",
+			"description": "Also delay the left and right buttons in platformer levels. Off by default, so only the jump button is buffered.",
+			"default": false
+		}
+	}
+}
