@@ -17,7 +17,7 @@ jobs:
           - name: macOS
             os: macos-latest
           - name: iOS
-            os: macos-15
+            os: macos-latest
             target: iOS
           - name: Android32
             os: ubuntu-latest
@@ -35,7 +35,8 @@ jobs:
       - name: Build the mod
         uses: geode-sdk/build-geode-mod@main
         with:
-          sdk: latest
+          bindings: vwtfafa/bindings
+          bindings-ref: fix/2.2081-depends
           combine: true
           target: ${{ matrix.config.target }}
 
