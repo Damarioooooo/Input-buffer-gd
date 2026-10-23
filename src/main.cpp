@@ -18,10 +18,15 @@ namespace pib {
 		bool down;
 	};
 
-	enum class Outcome { Survives, Dies, Unknown };
+	// Survives: ran the whole lookahead alive.
+	// Dies:     clone crashed.
+	// Special:  clone reached a portal/orb/pad/trigger alive (can't simulate past it).
+	// Timeout:  ran out of time budget, result unknown.
+	enum class Outcome { Survives, Dies, Special, Timeout };
 
 	inline std::deque<Pending> g_queue;
 	inline PlayerObject* g_clone = nullptr;
+	inline GJBaseGameLayer* g_cloneLayer = nullptr;
 	inline int64_t g_updates = 0;   // physics updates of the real player so far
 	inline int64_t g_shift = 0;     // delay applied to the latest click (keeps rhythm)
 	inline float g_dt = 1.f / 240.f;
@@ -40,7 +45,7 @@ namespace pib {
 		return Mod::get()->getSettingValue<int64_t>("lookahead-ticks");
 	}
 	inline int64_t holdTicks() {
-		return Mod::get()->getSettingValue<int64_t>("hold-ticks");
+		return std::max<int64_t>(1, Mod::get()->getSettingValue<int64_t>("hold-ticks"));
 	}
 	inline int64_t budgetMs() {
 		return Mod::get()->getSettingValue<int64_t>("time-budget-ms");
@@ -62,6 +67,8 @@ namespace pib {
 		g_shift = 0;
 		g_bypass = false;
 		g_simulating = false;
+		g_cloneDied = false;
+		g_cloneTouchedSpecial = false;
 	}
 
 	inline void releaseClone() {
@@ -69,14 +76,18 @@ namespace pib {
 			g_clone->release();
 			g_clone = nullptr;
 		}
+		g_cloneLayer = nullptr;
 	}
 
+	// The clone is tied to the layer it was created for; rebuild it if the layer changed.
 	inline bool ensureClone(GJBaseGameLayer* layer) {
-		if (g_clone) return true;
+		if (g_clone && g_cloneLayer == layer) return true;
+		releaseClone();
 		g_clone = PlayerObject::create(1, 1, layer, layer, false);
 		if (!g_clone) return false;
 		g_clone->retain();
 		g_clone->setVisible(false);
+		g_cloneLayer = layer;
 		return true;
 	}
 
@@ -156,11 +167,12 @@ namespace pib {
 			layer->checkCollisions(g_clone, g_dt, false);
 
 			if (g_cloneDied) { result = Outcome::Dies; break; }
-			if (g_cloneTouchedSpecial) { result = Outcome::Unknown; break; }
-			if ((t & 15) == 15 && Clock::now() > deadline) { result = Outcome::Unknown; break; }
+			if (g_cloneTouchedSpecial) { result = Outcome::Special; break; }
+			if ((t & 15) == 15 && Clock::now() > deadline) { result = Outcome::Timeout; break; }
 		}
 
 		g_simulating = false;
+		g_clone->releaseAllButtons();
 		return result;
 	}
 
@@ -169,12 +181,16 @@ namespace pib {
 		if (!ensureClone(layer)) return 0;
 		auto deadline = Clock::now() + std::chrono::milliseconds(budgetMs());
 
+		// Only intervene if the unmodified input is known to kill.
 		if (simulate(layer, real, 0, pressEvent, deadline) != Outcome::Dies) return 0;
 
 		int64_t maxTicks = maxDelayTicks();
 		for (int64_t d = 1; d <= maxTicks; ++d) {
 			if (Clock::now() > deadline) return 0;
-			if (simulate(layer, real, d, pressEvent, deadline) == Outcome::Survives) return d;
+			auto r = simulate(layer, real, d, pressEvent, deadline);
+			if (r == Outcome::Timeout) return 0;
+			// Reaching a special object alive still beats a delay-0 death.
+			if (r == Outcome::Survives || r == Outcome::Special) return d;
 		}
 		return 0;
 	}
@@ -264,7 +280,8 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 class $modify(PIBPlayer, PlayerObject) {
 	void update(float dt) {
 		auto* pl = PlayLayer::get();
-		if (pl && this == pl->m_player1 && !pib::isClone(this)) {
+		PlayerObject* self = this;
+		if (pl && self == pl->m_player1 && !pib::isClone(self)) {
 			if (dt > 0.f) pib::g_dt = dt;
 
 			// deliver delayed clicks at the start of their tick
