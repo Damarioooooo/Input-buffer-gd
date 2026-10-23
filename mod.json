@@ -32,7 +32,7 @@
 			"type": "int",
 			"default": 4,
 			"min": 1,
-			"max": 24,
+			"max": 100,
 			"name": "Maximum delay (frames)",
 			"description": "The most a click may be held back. 1 frame = 4 physics ticks at 60 FPS.",
 			"control": { "slider": true, "arrows": true, "input": true }
