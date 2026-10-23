@@ -26,7 +26,7 @@ jobs:
       - name: Build the mod
         uses: geode-sdk/build-geode-mod@main
         with:
-          sdk: 5.11.2
+          sdk: v5.11.2
           combine: true
           target: ${{ matrix.config.target }}
           build-config: ${{ matrix.config.build-type || 'RelWithDebInfo' }}
