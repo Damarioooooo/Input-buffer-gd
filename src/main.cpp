@@ -1,6 +1,7 @@
 #include <Geode/Geode.hpp>
 #include <Geode/ui/Notification.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/MenuLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
 
@@ -46,6 +47,7 @@ namespace pib {
 	inline bool g_simulating = false;
 	inline bool g_cloneDied = false;
 	inline bool g_cloneTouchedSpecial = false;
+	inline bool g_tickSeen = false; // probe: has the update hook run in this level?
 	inline std::string g_lastReason;
 
 	inline bool enabled() {
@@ -74,9 +76,9 @@ namespace pib {
 	}
 
 	// Log + short on-screen message (only call outside of simulation).
-	inline void say(std::string const& msg) {
+	inline void say(std::string const& msg, float secs = 0.9f) {
 		log::info("{}", msg);
-		Notification::create(msg, NotificationIcon::None, 0.9f)->show();
+		Notification::create(msg, NotificationIcon::None, secs)->show();
 	}
 
 	inline bool isClone(PlayerObject* p) {
@@ -239,6 +241,20 @@ namespace pib {
 	}
 }
 
+// Probe 1: proves this exact build is installed and loaded (label on the main menu).
+class $modify(PIBMenu, MenuLayer) {
+	bool init() {
+		if (!MenuLayer::init()) return false;
+		auto size = CCDirector::sharedDirector()->getWinSize();
+		auto* label = CCLabelBMFont::create("PIB v0.5.1 loaded", "bigFont.fnt");
+		label->setScale(0.4f);
+		label->setPosition({ size.width / 2.f, 12.f });
+		label->setZOrder(100);
+		this->addChild(label);
+		return true;
+	}
+};
+
 class $modify(PIBGameLayer, GJBaseGameLayer) {
 	void handleButton(bool down, int button, bool isPlayer1) {
 		auto* self = static_cast<GJBaseGameLayer*>(this);
@@ -330,6 +346,15 @@ class $modify(PIBPlayer, PlayerObject) {
 		auto* pl = PlayLayer::get();
 		PlayerObject* self = this;
 		if (pl && self == pl->m_player1 && !pib::isClone(self)) {
+			// Probe 2: proves the PlayerObject::update hook runs inside a level.
+			if (!pib::g_tickSeen) {
+				pib::g_tickSeen = true;
+				if (pib::debugOn()) {
+					auto* why = pib::inactiveReason(pl);
+					pib::say(fmt::format("PIB: update hook OK ({})", why ? why : "active"), 2.5f);
+				}
+			}
+
 			if (dt > 0.f) pib::g_dt = dt;
 
 			// deliver delayed clicks at the start of their tick
@@ -368,6 +393,7 @@ class $modify(PIBPlayLayer, PlayLayer) {
 	void onQuit() {
 		pib::resetRuntime();
 		pib::releaseClone();
+		pib::g_tickSeen = false;
 		PlayLayer::onQuit();
 	}
 
