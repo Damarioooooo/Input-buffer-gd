@@ -6,36 +6,65 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"version": "v1.0.0",
+	"version": "v2.0.0",
 	"id": "yourname.input-buffer",
 	"name": "Input Buffer",
 	"developer": "YourName",
-	"description": "Delays your clicks by a set number of ticks so early inputs still land.",
+	"description": "Simulates your click a few ticks ahead. If clicking now would kill you and a slightly later click survives, the click is held back and delivered later.",
 	"tags": ["enhancement"],
 	"settings": {
 		"enabled": {
 			"type": "bool",
 			"name": "Enabled",
-			"description": "Turn the input buffer on or off.",
+			"description": "Turn the predictive buffer on or off.",
 			"default": true
 		},
-		"delay-ticks": {
+		"max-delay-frames": {
 			"type": "int",
-			"name": "Buffer (ticks)",
-			"description": "How many physics ticks each click waits before it is actually input. GD runs at 240 ticks per second by default, so 1 tick is about 4.2 ms and 12 ticks is about 50 ms. 0 = no delay.",
-			"default": 3,
-			"min": 0,
-			"max": 60,
-			"control": {
-				"slider": true,
-				"arrows": true,
-				"input": true
-			}
+			"name": "Maximum delay (frames)",
+			"description": "The most a click may be held back. 1 frame = 4 physics ticks at 60 FPS.",
+			"default": 8,
+			"min": 1,
+			"max": 16,
+			"control": { "slider": true, "arrows": true, "input": true }
 		},
-		"affect-movement": {
+		"lookahead-ticks": {
+			"type": "int",
+			"name": "Look-ahead (ticks)",
+			"description": "How far ahead each prediction runs. 240 ticks = 1 second. Higher sees further but costs more time per click.",
+			"default": 100,
+			"min": 30,
+			"max": 240,
+			"control": { "slider": true, "arrows": true, "input": true }
+		},
+		"hold-ticks": {
+			"type": "int",
+			"name": "Assumed hold length (ticks)",
+			"description": "How long the prediction assumes you hold each click before releasing.",
+			"default": 12,
+			"min": 1,
+			"max": 60,
+			"control": { "slider": true, "arrows": true, "input": true }
+		},
+		"time-budget-ms": {
+			"type": "int",
+			"name": "Time budget per click (ms)",
+			"description": "If a prediction takes longer than this, your click goes through normally so the game never stutters.",
+			"default": 8,
+			"min": 1,
+			"max": 30,
+			"control": { "slider": true, "arrows": true, "input": true }
+		},
+		"wave-release": {
 			"type": "bool",
-			"name": "Also buffer left/right (platformer)",
-			"description": "Also delay the left and right buttons in platformer levels. Off by default, so only the jump button is buffered.",
+			"name": "Predict wave releases",
+			"description": "Also hold back wave releases that would crash.",
+			"default": true
+		},
+		"practice-only": {
+			"type": "bool",
+			"name": "Practice mode only",
+			"description": "Only act in practice mode.",
 			"default": false
 		}
 	}
