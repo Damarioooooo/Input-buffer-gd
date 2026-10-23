@@ -6,7 +6,7 @@
 	},
 	"id": "cesar.input-buffer",
 	"name": "Predictive Input Buffer",
-	"version": "v0.5.1",
+	"version": "v0.5.2",
 	"developer": "CesarGD96",
 	"description": "Simulates your click a few ticks ahead. If clicking now would kill you and a slightly later click survives, the click is held back and delivered later.",
 	"settings": {
@@ -39,7 +39,7 @@
 		},
 		"lookahead-ticks": {
 			"type": "int",
-			"default": 60,
+			"default": 90,
 			"min": 30,
 			"max": 240,
 			"name": "Look-ahead (ticks)",
@@ -57,7 +57,7 @@
 		},
 		"time-budget-ms": {
 			"type": "int",
-			"default": 6,
+			"default": 4,
 			"min": 1,
 			"max": 20,
 			"name": "Time budget per click (ms)",
