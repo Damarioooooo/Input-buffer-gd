@@ -1,4 +1,4 @@
-name: Build Geode Mod
+name: Build Binaries
 
 on:
   workflow_dispatch:
@@ -14,7 +14,6 @@ jobs:
         config:
           - name: iOS
             os: macos-latest
-            extra_flags: '-DGEODE_TARGET_PLATFORM=iOS'
             target: iOS
 
     name: ${{ matrix.config.name }}
@@ -26,16 +25,15 @@ jobs:
       - name: Build the mod
         uses: geode-sdk/build-geode-mod@main
         with:
-          sdk: nightly
+          bindings: vwtfafa/bindings
+          bindings-ref: fix/2.2081-depends
           combine: true
           target: ${{ matrix.config.target }}
-          build-config: ${{ matrix.config.build-type || 'RelWithDebInfo' }}
-          configure-args: ${{ matrix.config.extra_flags }}
 
   package:
     name: Package builds
     runs-on: ubuntu-latest
-    needs: ['build']
+    needs: ["build"]
 
     steps:
       - uses: geode-sdk/build-geode-mod/combine@main
