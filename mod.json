@@ -1,71 +1,28 @@
 {
-	"geode": "5.11.2",
-	"gd": {
-		"win": "2.2081",
-		"android": "2.2081",
-		"mac": "2.2081",
-		"ios": "2.2081"
-	},
-	"version": "v2.0.0",
-	"id": "yourname.input-buffer",
-	"name": "Input Buffer",
-	"developer": "YourName",
-	"description": "Simulates your click a few ticks ahead. If clicking now would kill you and a slightly later click survives, the click is held back and delivered later.",
-	"tags": ["enhancement", "gameplay"],
-	"settings": {
-		"enabled": {
-			"type": "bool",
-			"name": "Enabled",
-			"description": "Turn the predictive buffer on or off.",
-			"default": true
-		},
-		"max-delay-frames": {
-			"type": "int",
-			"name": "Maximum delay (frames)",
-			"description": "The most a click may be held back. 1 frame = 4 physics ticks at 60 FPS.",
-			"default": 2,
-			"min": 1,
-			"max": 8,
-			"control": { "slider": true, "arrows": true, "input": true }
-		},
-		"lookahead-ticks": {
-			"type": "int",
-			"name": "Look-ahead (ticks)",
-			"description": "How far ahead each prediction runs. 240 ticks = 1 second. Higher sees further but costs more time per click.",
-			"default": 60,
-			"min": 30,
-			"max": 240,
-			"control": { "slider": true, "arrows": true, "input": true }
-		},
-		"hold-ticks": {
-			"type": "int",
-			"name": "Assumed hold length (ticks)",
-			"description": "How long the prediction assumes you hold each click before releasing.",
-			"default": 8,
-			"min": 1,
-			"max": 60,
-			"control": { "slider": true, "arrows": true, "input": true }
-		},
-		"time-budget-ms": {
-			"type": "int",
-			"name": "Time budget per click (ms)",
-			"description": "If a prediction takes longer than this, your click goes through normally so the game never stutters.",
-			"default": 3,
-			"min": 1,
-			"max": 10,
-			"control": { "slider": true, "arrows": true, "input": true }
-		},
-		"wave-release": {
-			"type": "bool",
-			"name": "Predict wave releases",
-			"description": "Also hold back wave releases that would crash.",
-			"default": true
-		},
-		"practice-only": {
-			"type": "bool",
-			"name": "Practice mode only",
-			"description": "Only act in practice mode.",
-			"default": false
-		}
-	}
+  "geode": "5.11.2",
+  "gd": {
+    "win": "2.2081",
+    "ios": "2.2081"
+  },
+  "id": "cesar.input-buffer",
+  "name": "Predictive Input Buffer",
+  "version": "v0.4.2",
+  "developer": "CesarGD96",
+  "description": "Trajectory-based 1–8 update input safety buffer inspired by the attached reference mod.",
+  "settings": {
+    "enabled": {
+      "type": "bool",
+      "default": true,
+      "name": "Enable Predictive Buffer",
+      "description": "Turn predictive input delaying on or off without restarting. Turning it off immediately flushes queued input."
+    },
+    "max-delay-frames": {
+      "type": "int",
+      "default": 2,
+      "min": 1,
+      "max": 8,
+      "name": "Maximum Delay (frames)",
+      "description": "Search for the earliest safe input frame within this many game updates. If no safe candidate is found in this window, the original input passes through."
+    }
+  }
 }
