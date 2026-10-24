@@ -21,6 +21,7 @@ jobs:
           sdk: v5.11.2
           bindings: vwtfafa/bindings
           bindings-ref: c0c808828d456e54164b60a589b0edd6172b327a
+          configure-args: -DSKIP_BUILDING_CODEGEN=OFF
 
       - name: Upload .geode artifact
         uses: actions/upload-artifact@v4
