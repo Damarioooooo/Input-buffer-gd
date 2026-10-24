@@ -1,174 +1,28 @@
 {
-	"geode": "5.11.2",
-	"gd": {
-		"win": "2.2081",
-		"ios": "2.2081"
-	},
-	"id": "cesar.input-buffer",
-	"name": "Predictive Input Buffer",
-	"version": "v0.7.6",
-	"developer": "CesarGD96",
-	"description": "Two buffer modes. Predictive: if clicking now would kill you, your click is held back and the mod fires its own click at the first moment that survives. Classic: a click made in the air is remembered and fired when you land. Includes per-tick wave correction, orb assist and a noclip toggle.",
-	"settings": {
-		"enabled": {
-			"type": "bool",
-			"default": true,
-			"name": "Enable Buffer",
-			"description": "Turn the buffer on or off without restarting."
-		},
-		"noclip": {
-			"type": "bool",
-			"default": false,
-			"name": "Noclip",
-			"description": "You can't die to spikes, blocks or saws. Also toggleable with the NC button in the top-left of a level."
-		},
-		"mode": {
-			"type": "string",
-			"default": "Predictive",
-			"one-of": [
-				"Predictive",
-				"Classic"
-			],
-			"name": "Buffer mode",
-			"description": "Predictive: holds back a click that would kill you and fires its own at a moment that survives. Classic: remembers a click made in the air and fires it when you land."
-		},
-		"classic-ticks": {
-			"type": "int",
-			"default": 12,
-			"min": 1,
-			"max": 240,
-			"name": "Classic: buffer window (ticks)",
-			"description": "Classic mode only. How long before landing a click is remembered. 4 ticks = 1 frame at 60 FPS, 240 ticks = 1 second.",
-			"control": {
-				"slider": true,
-				"arrows": true,
-				"input": true
-			}
-		},
-		"practice-only": {
-			"type": "bool",
-			"default": false,
-			"name": "Practice mode only",
-			"description": "Only act in practice mode."
-		},
-		"wave-enabled": {
-			"type": "bool",
-			"default": true,
-			"name": "Wave assist",
-			"description": "Predictive mode only. Checks the wave every physics tick and corrects holds and releases that would hit a spike or block. Your input is left alone when it is safe."
-		},
-		"wave-lookahead-ticks": {
-			"type": "int",
-			"default": 96,
-			"min": 8,
-			"max": 240,
-			"name": "Wave: look-ahead (ticks)",
-			"description": "How far ahead the wave controller simulates each tick. Lower this if the game stutters in wave.",
-			"control": {
-				"slider": true,
-				"arrows": true,
-				"input": true
-			}
-		},
-		"wave-react-ticks": {
-			"type": "int",
-			"default": 60,
-			"min": 2,
-			"max": 120,
-			"name": "Wave: react window (ticks)",
-			"description": "The wave only overrides you when death is within this many ticks. Higher = earlier saves, but it takes over more often.",
-			"control": {
-				"slider": true,
-				"arrows": true,
-				"input": true
-			}
-		},
-		"orb-assist": {
-			"type": "bool",
-			"default": true,
-			"name": "Orb assist",
-			"description": "If you click shortly before an orb, the mod re-presses the button the moment you touch it."
-		},
-		"orb-window-ticks": {
-			"type": "int",
-			"default": 24,
-			"min": 2,
-			"max": 240,
-			"name": "Orb: early click window (ticks)",
-			"description": "How early before an orb a click still counts.",
-			"control": {
-				"slider": true,
-				"arrows": true,
-				"input": true
-			}
-		},
-		"max-delay-frames": {
-			"type": "int",
-			"default": 12,
-			"min": 1,
-			"max": 250,
-			"name": "Predictive: maximum wait (frames)",
-			"description": "Predictive mode only. The longest a click may be held back after landing while waiting for a safe moment. 1 frame = 4 physics ticks at 60 FPS. If no safe moment shows up in this time, see 'If no safe moment is found'.",
-			"control": {
-				"slider": true,
-				"arrows": true,
-				"input": true
-			}
-		},
-		"on-fail": {
-			"type": "string",
-			"default": "Drop click",
-			"one-of": [
-				"Drop click",
-				"Let it through"
-			],
-			"name": "If no safe moment is found",
-			"description": "Predictive mode only. Drop click: a click that can't be made safely is thrown away so it can't kill you. Let it through: the click is fired anyway after the wait window (old behaviour)."
-		},
-		"lookahead-ticks": {
-			"type": "int",
-			"default": 240,
-			"min": 30,
-			"max": 240,
-			"name": "Predictive: look-ahead (ticks)",
-			"description": "Predictive mode only. Upper limit on how far ahead each prediction runs. Ground modes stop earlier, a few ticks after the simulated landing. 240 ticks = 1 second.",
-			"control": {
-				"slider": true,
-				"arrows": true,
-				"input": true
-			}
-		},
-		"hold-ticks": {
-			"type": "int",
-			"default": 8,
-			"min": 1,
-			"max": 60,
-			"name": "Predictive: hold length (ticks)",
-			"description": "Predictive mode only. How long each click is held before the mod releases it. The prediction uses the same value.",
-			"control": {
-				"slider": true,
-				"arrows": true,
-				"input": true
-			}
-		},
-		"time-budget-ms": {
-			"type": "int",
-			"default": 8,
-			"min": 1,
-			"max": 100,
-			"name": "Predictive: time budget per check (ms)",
-			"description": "Each safety check is cut off after this long. A check that runs out of time holds the click and tries again next tick. Too low and the mod can't decide in time; too high and the game may stutter.",
-			"control": {
-				"slider": true,
-				"arrows": true,
-				"input": true
-			}
-		},
-		"debug": {
-			"type": "bool",
-			"default": false,
-			"name": "Debug messages",
-			"description": "Show a short on-screen message for every decision the buffer makes."
-		}
-	}
+  "geode": "5.11.2",
+  "gd": {
+    "win": "2.2081",
+    "ios": "2.2081"
+  },
+  "id": "cesar.input-buffer",
+  "name": "Predictive Input Buffer",
+  "version": "v0.4.2",
+  "developer": "CesarGD96",
+  "description": "Trajectory-based 1–8 update input safety buffer inspired by the attached reference mod.",
+  "settings": {
+    "enabled": {
+      "type": "bool",
+      "default": true,
+      "name": "Enable Predictive Buffer",
+      "description": "Turn predictive input delaying on or off without restarting. Turning it off immediately flushes queued input."
+    },
+    "max-delay-frames": {
+      "type": "int",
+      "default": 2,
+      "min": 1,
+      "max": 8,
+      "name": "Maximum Delay (frames)",
+      "description": "Search for the earliest safe input frame within this many game updates. If no safe candidate is found in this window, the original input passes through."
+    }
+  }
 }
