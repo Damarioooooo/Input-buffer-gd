@@ -27,6 +27,7 @@ jobs:
         with:
           bindings: vwtfafa/bindings
           bindings-ref: fix/2.2081-depends
+          configure-args: -DSKIP_BUILDING_CODEGEN=OFF
           combine: true
           target: ${{ matrix.config.target }}
 
