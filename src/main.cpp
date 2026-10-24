@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <deque>
 #include <string>
+#include <vector>
 
 using namespace geode::prelude;
 
@@ -66,6 +67,16 @@ namespace pib {
 	inline bool g_orbArmed = false;
 	inline int g_releaseIn = 0;
 	inline bool g_wavePrev = false;
+
+	// ---- diagnostics ----
+	inline CCPoint g_simStart = CCPoint{0.f, 0.f};
+	inline CCPoint g_simEnd = CCPoint{0.f, 0.f};
+	inline int64_t g_simTicks = 0;
+	inline bool g_recordTrace = false;
+	inline std::vector<CCPoint> g_trace;
+	inline bool g_traceActive = false;
+	inline int64_t g_traceStart = 0;
+	inline int g_traceNext = 0;
 
 	inline bool enabled() {
 		return Mod::get()->getSettingValue<bool>("enabled");
@@ -147,6 +158,10 @@ namespace pib {
 		g_orbArmed = false;
 		g_releaseIn = 0;
 		g_wavePrev = false;
+		g_recordTrace = false;
+		g_traceActive = false;
+		g_traceNext = 0;
+		g_trace.clear();
 	}
 
 	inline void releaseClone() {
@@ -269,6 +284,10 @@ namespace pib {
 		g_cloneTouchedSpecial = false;
 		g_simulating = true;
 
+		g_simStart = g_clone->m_position;
+		g_simTicks = 0;
+		if (g_recordTrace) g_trace.clear();
+
 		if (!pressEvent) g_clone->pushButton(PlayerButton::Jump);
 
 		int64_t hold = holdTicks();
@@ -286,11 +305,15 @@ namespace pib {
 			g_clone->update(g_dt);
 			layer->checkCollisions(g_clone, g_dt, false);
 
+			g_simTicks = t + 1;
+			if (g_recordTrace) g_trace.push_back(g_clone->m_position);
+
 			if (g_cloneDied) { result = Outcome::Dies; break; }
 			if (g_cloneTouchedSpecial) { result = Outcome::Special; break; }
 			if ((t & 7) == 7 && Clock::now() > deadline) { result = Outcome::Timeout; break; }
 		}
 
+		g_simEnd = g_clone->m_position;
 		g_simulating = false;
 		g_clone->releaseAllButtons();
 		return result;
@@ -302,17 +325,47 @@ namespace pib {
 			return false;
 		}
 		auto start = Clock::now();
+		g_recordTrace = debugOn();
 		auto r0 = simulate(layer, real, 0, true, start + std::chrono::milliseconds(budgetMs()));
+		g_recordTrace = false;
 		double took = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 		if (r0 == Outcome::Dies) {
 			if (debugOn()) say(fmt::format("PIB press: would die -> holding click ({:.1f}ms)", took));
 			return true;
 		}
 		if (debugOn()) {
-			say(fmt::format("PIB press: now {} -> pass through ({:.1f}ms of {}ms)",
-				name(r0), took, budgetMs()));
+			say(fmt::format("PIB press: now {} | sim moved dx={:.0f} dy={:.0f} in {} ticks ({:.1f}ms)",
+				name(r0), g_simEnd.x - g_simStart.x, g_simEnd.y - g_simStart.y,
+				g_simTicks, took), 2.5f);
+			if (r0 == Outcome::Survives) {
+				g_traceActive = true;
+				g_traceStart = g_updates;
+				g_traceNext = 0;
+			}
 		}
 		return false;
+	}
+
+	// Compares the real player with the simulated path after a pass-through click.
+	inline void traceCheck(PlayerObject* real) {
+		if (!g_traceActive) return;
+		if (real->m_isDead) { g_traceActive = false; return; }
+
+		static const int64_t marks[] = {8, 24, 60};
+		int64_t k = g_updates - g_traceStart;
+		if (g_traceNext >= 3) { g_traceActive = false; return; }
+		if (k != marks[g_traceNext]) return;
+
+		g_traceNext++;
+		if (k <= static_cast<int64_t>(g_trace.size())) {
+			auto sim = g_trace[k - 1];
+			auto rp = real->m_position;
+			say(fmt::format("PIB trace k={}: real ({:.0f},{:.0f}) sim ({:.0f},{:.0f})",
+				k, rp.x, rp.y, sim.x, sim.y), 3.0f);
+		} else {
+			say(fmt::format("PIB trace k={}: sim stopped early", k), 3.0f);
+		}
+		if (g_traceNext >= 3) g_traceActive = false;
 	}
 
 	inline void tickPending(PlayLayer* pl, PlayerObject* p) {
@@ -354,8 +407,6 @@ namespace pib {
 
 	// ---------------- wave controller ----------------
 
-	// Run the clone with a wave plan: hold the opposite of `want` for `flip` ticks,
-	// then follow `want` for the rest. flip = 0 means just follow `want`.
 	inline Outcome simulateWave(
 		GJBaseGameLayer* layer, PlayerObject* real, bool want, int64_t flip,
 		int64_t total, Clock::time_point deadline, int64_t& diedAt
@@ -390,8 +441,6 @@ namespace pib {
 		return result;
 	}
 
-	// Runs every physics tick while the player is a wave. Chooses what the
-	// button should actually be doing this tick.
 	inline void waveTick(PlayLayer* pl, PlayerObject* p) {
 		bool want = g_userDown;
 		bool decide = want;
@@ -403,7 +452,6 @@ namespace pib {
 			int64_t died = -1;
 
 			auto r = simulateWave(layer, p, want, 0, total, deadline, died);
-			// Only take over when death is close, so your own line is kept when it is safe.
 			if (r == Outcome::Dies && died <= waveReact()) {
 				static const int64_t flips[] = {1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 48};
 				for (auto f : flips) {
@@ -425,8 +473,6 @@ namespace pib {
 
 	// ---------------- orb assist ----------------
 
-	// Called when the real player touches an orb. If a click was made a little
-	// earlier, fire a fresh click right now so the orb activates.
 	inline void orbAssist(PlayerObject* player) {
 		auto* pl = PlayLayer::get();
 		if (!pl || player != pl->m_player1) return;
@@ -452,7 +498,7 @@ class $modify(PIBMenu, MenuLayer) {
 	bool init() {
 		if (!MenuLayer::init()) return false;
 		auto size = CCDirector::sharedDirector()->getWinSize();
-		auto* label = CCLabelBMFont::create("PIB v0.7.0 loaded", "bigFont.fnt");
+		auto* label = CCLabelBMFont::create("PIB v0.7.2 loaded", "bigFont.fnt");
 		label->setScale(0.4f);
 		label->setPosition({ size.width / 2.f, 12.f });
 		label->setZOrder(100);
@@ -472,7 +518,6 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 			return;
 		}
 
-		// A real input from the player: remember it.
 		pib::g_userDown = down;
 		if (down) {
 			pib::g_userPressTick = pib::g_updates;
@@ -512,8 +557,6 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 		auto* player = pl->m_player1;
 		int64_t delay = 0;
 
-		// Wave: the controller owns the button. We only record what the player wants;
-		// the controller applies it (or a safe correction) on the next physics tick.
 		if (player->m_isDart) {
 			pib::flush(pl);
 			pib::g_pendingPress = false;
@@ -620,7 +663,6 @@ class $modify(PIBPlayer, PlayerObject) {
 				}
 			}
 
-			// Ignore lag-spike dt values so the simulation keeps matching the real step.
 			if (dt >= 0.001f && dt <= 1.f / 120.f) pib::g_dt = dt;
 
 			bool predictive = !pib::classicMode() && pib::inactiveReason(pl) == nullptr;
@@ -629,7 +671,6 @@ class $modify(PIBPlayer, PlayerObject) {
 			if (waveManaged) {
 				pib::g_pendingPress = false;
 			} else {
-				// leaving the wave: give the game the real finger state back
 				if (pib::g_wavePrev) {
 					pib::g_wavePrev = false;
 					if (pib::g_actualDown != pib::g_userDown) pib::deliver(pl, pib::g_userDown);
@@ -637,14 +678,12 @@ class $modify(PIBPlayer, PlayerObject) {
 				if (pib::g_pendingPress) pib::tickPending(pl, self);
 			}
 
-			// delayed clicks
 			while (!pib::g_queue.empty() && pib::g_queue.front().fireAt <= pib::g_updates) {
 				auto e = pib::g_queue.front();
 				pib::g_queue.pop_front();
 				pib::deliver(pl, e.down);
 			}
 
-			// let go of an orb re-press if the finger is already up
 			if (pib::g_releaseIn > 0 && --pib::g_releaseIn == 0 && !pib::g_userDown) {
 				pib::deliver(pl, false);
 			}
@@ -656,6 +695,7 @@ class $modify(PIBPlayer, PlayerObject) {
 
 			PlayerObject::update(dt);
 			pib::g_updates++;
+			pib::traceCheck(self);
 			pib::classicTick(pl, self);
 			return;
 		}
@@ -719,7 +759,6 @@ class $modify(PIBPlayLayer, PlayLayer) {
 			pib::g_cloneDied = true;
 			return;
 		}
-		// Noclip: plain toggle, ignores every death.
 		if (pib::noclip()) return;
 		PlayLayer::destroyPlayer(player, object);
 	}
