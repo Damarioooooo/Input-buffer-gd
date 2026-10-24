@@ -132,6 +132,16 @@ namespace pib {
 	inline bool debugOn() {
 		return Mod::get()->getSettingValue<bool>("debug");
 	}
+	// "Drop click": a click that never found a safe moment is thrown away.
+	// "Let it through": old behaviour, the click is fired anyway (and kills you).
+	inline bool dropOnFail() {
+		return Mod::get()->getSettingValue<std::string>("on-fail") != "Let it through";
+	}
+	// A press that kills the clone within this many ticks is "already doomed".
+	// That means either nothing can save the player, or the simulation is not
+	// trustworthy right now (for example noclip carried the real player into a
+	// hazard). In that case the player's own input is passed through untouched.
+	constexpr int64_t kDoomedTicks = 2;
 
 	inline void say(std::string const& msg, float secs = 0.9f) {
 		log::info("{}", msg);
@@ -306,6 +316,9 @@ namespace pib {
 		}
 
 		layer->checkCollisions(g_clone, g_dt, false);
+
+		// Some death paths set the flag without going through destroyPlayer.
+		if (g_clone->m_isDead) g_cloneDied = true;
 	}
 
 	// FIX: for ground modes the simulation now ends a few ticks after the clone
@@ -380,6 +393,10 @@ namespace pib {
 		auto r0 = simulate(layer, real, 0, true, start + std::chrono::milliseconds(budgetMs()));
 		g_recordTrace = false;
 		double took = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+		if (r0 == Outcome::Dies && g_simTicks <= kDoomedTicks) {
+			if (debugOn()) say("PIB press: doomed within 2 ticks -> passing click through", 1.5f);
+			return false;
+		}
 		if (r0 == Outcome::Dies || r0 == Outcome::Timeout) {
 			if (debugOn()) {
 				say(fmt::format("PIB press: {} at tick {} -> holding click ({:.1f}ms){}",
@@ -424,6 +441,14 @@ namespace pib {
 
 	// FIX: only simulates while grounded, counts the wait from landing (not from
 	// the early click), and releases with the same hold length the sim assumed.
+	inline void dropPending(std::string const& why) {
+		g_pendingPress = false;
+		g_pendingGrounded = false;
+		g_pendingReleased = false;
+		g_pendingHold = 0;
+		if (debugOn()) say(fmt::format("PIB: click DROPPED - {}", why), 1.5f);
+	}
+
 	inline void tickPending(PlayLayer* pl, PlayerObject* p) {
 		bool gm = groundMode(p);
 		bool fire = false;
@@ -436,6 +461,7 @@ namespace pib {
 		} else if (!p->m_isOnGround) {
 			g_pendingGrounded = false;
 			if (g_updates - g_pendingSince >= 480) {
+				if (dropOnFail()) { dropPending("never landed"); return; }
 				fire = true;
 				why = "never landed";
 			}
@@ -447,6 +473,9 @@ namespace pib {
 			waited = g_updates - g_groundSince;
 
 			if (waited >= maxDelayTicks()) {
+				// No safe moment was found in time. The click would have killed
+				// the player, so throw it away instead of firing it.
+				if (dropOnFail()) { dropPending("no safe moment in wait window"); return; }
 				fire = true;
 				why = "wait limit reached";
 			} else {
@@ -460,6 +489,9 @@ namespace pib {
 					if (r == Outcome::Survives || r == Outcome::Special) {
 						fire = true;
 						why = fmt::format("safe ({})", name(r));
+					} else if (r == Outcome::Dies && g_simTicks <= kDoomedTicks) {
+						fire = true;
+						why = "already doomed, passing input through";
 					}
 				}
 			}
@@ -578,7 +610,7 @@ class $modify(PIBMenu, MenuLayer) {
 	bool init() {
 		if (!MenuLayer::init()) return false;
 		auto size = CCDirector::sharedDirector()->getWinSize();
-		auto* label = CCLabelBMFont::create("PIB v0.7.4 loaded", "bigFont.fnt");
+		auto* label = CCLabelBMFont::create("PIB v0.7.5 loaded", "bigFont.fnt");
 		label->setScale(0.4f);
 		label->setPosition({ size.width / 2.f, 12.f });
 		label->setZOrder(100);
