@@ -87,6 +87,12 @@ namespace pib {
 	inline bool waveRelease() {
 		return Mod::get()->getSettingValue<bool>("wave-release");
 	}
+	inline bool noclip() {
+		return Mod::get()->getSettingValue<bool>("noclip");
+	}
+	inline bool waveEnabled() {
+		return Mod::get()->getSettingValue<bool>("wave-enabled");
+	}
 	inline bool practiceOnly() {
 		return Mod::get()->getSettingValue<bool>("practice-only");
 	}
@@ -362,7 +368,10 @@ namespace pib {
 		bool fire = false;
 		std::string why;
 
-		if (waited >= maxDelayTicks()) {
+		if (p->m_isDart && !waveEnabled()) {
+			fire = true;
+			why = "wave (prediction off)";
+		} else if (waited >= maxDelayTicks()) {
 			fire = true;
 			why = "wait limit reached";
 		} else {
@@ -404,7 +413,7 @@ class $modify(PIBMenu, MenuLayer) {
 	bool init() {
 		if (!MenuLayer::init()) return false;
 		auto size = CCDirector::sharedDirector()->getWinSize();
-		auto* label = CCLabelBMFont::create("PIB v0.6.1 loaded", "bigFont.fnt");
+		auto* label = CCLabelBMFont::create("PIB v0.6.3 loaded", "bigFont.fnt");
 		label->setScale(0.4f);
 		label->setPosition({ size.width / 2.f, 12.f });
 		label->setZOrder(100);
@@ -456,6 +465,16 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 
 		auto* player = pl->m_player1;
 		int64_t delay = 0;
+
+		// The wave is not modelled correctly by the simulation, so by default
+		// every wave input goes straight through untouched.
+		if (player->m_isDart && !pib::waveEnabled()) {
+			pib::flush(pl);
+			pib::g_pendingPress = false;
+			pib::g_shift = 0;
+			GJBaseGameLayer::handleButton(down, button, isPlayer1);
+			return;
+		}
 
 		// A click is already being held back: just remember what the player does with it.
 		if (pib::g_pendingPress) {
@@ -606,6 +625,8 @@ class $modify(PIBPlayLayer, PlayLayer) {
 			pib::g_cloneDied = true;   // the clone crashed: record it, never run the real death
 			return;
 		}
+		// Noclip: ignore normal deaths. The anti-cheat spike is still allowed to kill.
+		if (pib::noclip() && object != m_anticheatSpike) return;
 		PlayLayer::destroyPlayer(player, object);
 	}
 };
