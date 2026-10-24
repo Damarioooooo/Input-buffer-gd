@@ -5,70 +5,25 @@
 		"ios": "2.2081"
 	},
 	"id": "cesar.input-buffer",
-	"name": "Predictive Input Buffer",
-	"version": "v0.5.2",
+	"name": "Input Buffer",
+	"version": "v1.0.0",
 	"developer": "CesarGD96",
-	"description": "Simulates your click a few ticks ahead. If clicking now would kill you and a slightly later click survives, the click is held back and delivered later.",
+	"description": "If you click shortly before landing, the click is remembered and fired the moment you touch the ground.",
 	"settings": {
 		"enabled": {
 			"type": "bool",
 			"default": true,
-			"name": "Enable Predictive Buffer",
-			"description": "Turn predictive input delaying on or off without restarting."
+			"name": "Enable Input Buffer",
+			"description": "Turn the buffer on or off."
 		},
-		"practice-only": {
-			"type": "bool",
-			"default": false,
-			"name": "Practice mode only",
-			"description": "Only act in practice mode."
-		},
-		"wave-release": {
-			"type": "bool",
-			"default": true,
-			"name": "Predict wave releases",
-			"description": "Also hold back wave releases that would crash."
-		},
-		"max-delay-frames": {
-			"type": "int",
-			"default": 4,
-			"min": 1,
-			"max": 100,
-			"name": "Maximum delay (frames)",
-			"description": "The most a click may be held back. 1 frame = 4 physics ticks at 60 FPS.",
-			"control": { "slider": true, "arrows": true, "input": true }
-		},
-		"lookahead-ticks": {
-			"type": "int",
-			"default": 90,
-			"min": 30,
-			"max": 240,
-			"name": "Look-ahead (ticks)",
-			"description": "How far ahead each prediction runs. 240 ticks = 1 second.",
-			"control": { "slider": true, "arrows": true, "input": true }
-		},
-		"hold-ticks": {
+		"buffer-ticks": {
 			"type": "int",
 			"default": 8,
 			"min": 1,
 			"max": 60,
-			"name": "Assumed hold length (ticks)",
-			"description": "How long the prediction assumes you hold each click before releasing.",
+			"name": "Buffer window (ticks)",
+			"description": "How long before landing a click is remembered. 4 ticks = 1 frame at 60 FPS (240 ticks = 1 second).",
 			"control": { "slider": true, "arrows": true, "input": true }
-		},
-		"time-budget-ms": {
-			"type": "int",
-			"default": 4,
-			"min": 1,
-			"max": 20,
-			"name": "Time budget per click (ms)",
-			"description": "If a prediction takes longer than this, your click goes through normally.",
-			"control": { "slider": true, "arrows": true, "input": true }
-		},
-		"debug": {
-			"type": "bool",
-			"default": true,
-			"name": "Debug messages",
-			"description": "Show a short on-screen message for every click explaining what the buffer decided."
 		}
 	}
 }
