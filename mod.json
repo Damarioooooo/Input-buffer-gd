@@ -20,7 +20,7 @@
       "type": "int",
       "default": 2,
       "min": 1,
-      "max": 8,
+      "max": 64,
       "name": "Maximum Delay (frames)",
       "description": "Search for the earliest safe input frame within this many game updates. If no safe candidate is found in this window, the original input passes through."
     }
