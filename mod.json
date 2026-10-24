@@ -6,7 +6,7 @@
 	},
 	"id": "cesar.input-buffer",
 	"name": "Predictive Input Buffer",
-	"version": "v0.7.4",
+	"version": "v0.7.5",
 	"developer": "CesarGD96",
 	"description": "Two buffer modes. Predictive: if clicking now would kill you, your click is held back and the mod fires its own click at the first moment that survives. Classic: a click made in the air is remembered and fired when you land. Includes per-tick wave correction, orb assist and a noclip toggle.",
 	"settings": {
@@ -108,12 +108,22 @@
 			"min": 1,
 			"max": 250,
 			"name": "Predictive: maximum wait (frames)",
-			"description": "Predictive mode only. The longest a click may be held back after landing while waiting for a safe moment. 1 frame = 4 physics ticks at 60 FPS.",
+			"description": "Predictive mode only. The longest a click may be held back after landing while waiting for a safe moment. 1 frame = 4 physics ticks at 60 FPS. If no safe moment shows up in this time, see 'If no safe moment is found'.",
 			"control": {
 				"slider": true,
 				"arrows": true,
 				"input": true
 			}
+		},
+		"on-fail": {
+			"type": "string",
+			"default": "Drop click",
+			"one-of": [
+				"Drop click",
+				"Let it through"
+			],
+			"name": "If no safe moment is found",
+			"description": "Predictive mode only. Drop click: a click that can't be made safely is thrown away so it can't kill you. Let it through: the click is fired anyway after the wait window (old behaviour)."
 		},
 		"lookahead-ticks": {
 			"type": "int",
