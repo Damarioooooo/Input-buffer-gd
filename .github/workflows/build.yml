@@ -13,7 +13,7 @@ jobs:
       matrix:
         config:
           - name: iOS
-            os: macos-latest
+            os: macos-15
             target: iOS
 
     name: ${{ matrix.config.name }}
