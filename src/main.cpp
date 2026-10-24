@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <deque>
 #include <string>
@@ -67,6 +68,12 @@ namespace pib {
 	inline bool g_orbArmed = false;
 	inline int g_releaseIn = 0;
 	inline bool g_wavePrev = false;
+
+	// ---- forward movement measurement (clone fix) ----
+	inline float g_realDx = 1.3f;       // how far the real player moves forward per tick
+	inline float g_lastRealX = 0.f;
+	inline bool g_haveLastX = false;
+	inline bool g_manualX = false;      // the clone had to be moved forward by hand
 
 	// ---- diagnostics ----
 	inline CCPoint g_simStart = CCPoint{0.f, 0.f};
@@ -158,6 +165,8 @@ namespace pib {
 		g_orbArmed = false;
 		g_releaseIn = 0;
 		g_wavePrev = false;
+		g_haveLastX = false;
+		g_manualX = false;
 		g_recordTrace = false;
 		g_traceActive = false;
 		g_traceNext = 0;
@@ -275,6 +284,26 @@ namespace pib {
 		c->releaseAllButtons();
 	}
 
+	// One physics tick for the clone. If the game's own update did not move the
+	// clone forward, move it by the measured forward speed of the real player.
+	inline void stepClone(GJBaseGameLayer* layer) {
+		float mx0 = g_clone->m_position.x;
+		float nx0 = g_clone->getPositionX();
+
+		g_clone->update(g_dt);
+
+		bool moved = std::fabs(g_clone->m_position.x - mx0) > 0.0001f
+			|| std::fabs(g_clone->getPositionX() - nx0) > 0.0001f;
+		if (!moved) {
+			g_manualX = true;
+			float nx = mx0 + g_realDx;
+			g_clone->m_position.x = nx;
+			g_clone->setPosition({ nx, g_clone->m_position.y });
+		}
+
+		layer->checkCollisions(g_clone, g_dt, false);
+	}
+
 	inline Outcome simulate(
 		GJBaseGameLayer* layer, PlayerObject* real, int64_t delay,
 		bool pressEvent, Clock::time_point deadline
@@ -282,6 +311,7 @@ namespace pib {
 		syncClone(real);
 		g_cloneDied = false;
 		g_cloneTouchedSpecial = false;
+		g_manualX = false;
 		g_simulating = true;
 
 		g_simStart = g_clone->m_position;
@@ -302,8 +332,7 @@ namespace pib {
 				g_clone->releaseButton(PlayerButton::Jump);
 			}
 
-			g_clone->update(g_dt);
-			layer->checkCollisions(g_clone, g_dt, false);
+			stepClone(layer);
 
 			g_simTicks = t + 1;
 			if (g_recordTrace) g_trace.push_back(g_clone->m_position);
@@ -330,13 +359,16 @@ namespace pib {
 		g_recordTrace = false;
 		double took = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
 		if (r0 == Outcome::Dies) {
-			if (debugOn()) say(fmt::format("PIB press: would die -> holding click ({:.1f}ms)", took));
+			if (debugOn()) {
+				say(fmt::format("PIB press: would die at tick {} -> holding click ({:.1f}ms){}",
+					g_simTicks, took, g_manualX ? " manual-x" : ""), 2.0f);
+			}
 			return true;
 		}
 		if (debugOn()) {
-			say(fmt::format("PIB press: now {} | sim moved dx={:.0f} dy={:.0f} in {} ticks ({:.1f}ms)",
+			say(fmt::format("PIB press: now {} | sim moved dx={:.0f} dy={:.0f} in {} ticks ({:.1f}ms){}",
 				name(r0), g_simEnd.x - g_simStart.x, g_simEnd.y - g_simStart.y,
-				g_simTicks, took), 2.5f);
+				g_simTicks, took, g_manualX ? " manual-x" : ""), 2.5f);
 			if (r0 == Outcome::Survives) {
 				g_traceActive = true;
 				g_traceStart = g_updates;
@@ -428,8 +460,7 @@ namespace pib {
 				else g_clone->releaseButton(PlayerButton::Jump);
 			}
 
-			g_clone->update(g_dt);
-			layer->checkCollisions(g_clone, g_dt, false);
+			stepClone(layer);
 
 			if (g_cloneDied) { result = Outcome::Dies; diedAt = t; break; }
 			if (g_cloneTouchedSpecial) { result = Outcome::Special; break; }
@@ -498,7 +529,7 @@ class $modify(PIBMenu, MenuLayer) {
 	bool init() {
 		if (!MenuLayer::init()) return false;
 		auto size = CCDirector::sharedDirector()->getWinSize();
-		auto* label = CCLabelBMFont::create("PIB v0.7.2 loaded", "bigFont.fnt");
+		auto* label = CCLabelBMFont::create("PIB v0.7.3 loaded", "bigFont.fnt");
 		label->setScale(0.4f);
 		label->setPosition({ size.width / 2.f, 12.f });
 		label->setZOrder(100);
@@ -664,6 +695,17 @@ class $modify(PIBPlayer, PlayerObject) {
 			}
 
 			if (dt >= 0.001f && dt <= 1.f / 120.f) pib::g_dt = dt;
+
+			// Measure how far the real player moves forward each tick.
+			{
+				float cx = self->m_position.x;
+				if (pib::g_haveLastX) {
+					float d = cx - pib::g_lastRealX;
+					if (d > 0.01f && d < 6.f) pib::g_realDx = d;
+				}
+				pib::g_lastRealX = cx;
+				pib::g_haveLastX = true;
+			}
 
 			bool predictive = !pib::classicMode() && pib::inactiveReason(pl) == nullptr;
 			bool waveManaged = predictive && self->m_isDart && pib::waveEnabled();
