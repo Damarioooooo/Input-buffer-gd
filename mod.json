@@ -6,9 +6,9 @@
 	},
 	"id": "cesar.input-buffer",
 	"name": "Predictive Input Buffer",
-	"version": "v0.6.0",
+	"version": "v0.6.1",
 	"developer": "CesarGD96",
-	"description": "Two buffer modes. Predictive: if clicking now would kill you and a slightly later click survives, your click is held back and delivered later. Classic: a click made in the air is remembered and fired when you land.",
+	"description": "Two buffer modes. Predictive: if clicking now would kill you, your click is held back and the mod fires its own click at the first moment that survives. Classic: a click made in the air is remembered and fired when you land.",
 	"settings": {
 		"enabled": {
 			"type": "bool",
@@ -19,7 +19,10 @@
 		"mode": {
 			"type": "string",
 			"default": "Predictive",
-			"one-of": ["Predictive", "Classic"],
+			"one-of": [
+				"Predictive",
+				"Classic"
+			],
 			"name": "Buffer mode",
 			"description": "Predictive: holds back a click that would kill you and fires its own at a moment that survives. Classic: remembers a click made in the air and fires it when you land."
 		},
@@ -30,7 +33,11 @@
 			"max": 240,
 			"name": "Classic: buffer window (ticks)",
 			"description": "Classic mode only. How long before landing a click is remembered. 4 ticks = 1 frame at 60 FPS, 240 ticks = 1 second. High values feel like the mod is clicking for you.",
-			"control": { "slider": true, "arrows": true, "input": true }
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"input": true
+			}
 		},
 		"practice-only": {
 			"type": "bool",
@@ -46,12 +53,16 @@
 		},
 		"max-delay-frames": {
 			"type": "int",
-			"default": 4,
+			"default": 12,
 			"min": 1,
 			"max": 100,
-			"name": "Predictive: maximum delay (frames)",
-			"description": "Predictive mode only. The most a click may be held back. 1 frame = 4 physics ticks at 60 FPS.",
-			"control": { "slider": true, "arrows": true, "input": true }
+			"name": "Predictive: maximum wait (frames)",
+			"description": "Predictive mode only. The longest a click may be held back while waiting for a safe moment. Raise this to be able to click very early. 1 frame = 4 physics ticks at 60 FPS.",
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"input": true
+			}
 		},
 		"lookahead-ticks": {
 			"type": "int",
@@ -60,7 +71,11 @@
 			"max": 240,
 			"name": "Predictive: look-ahead (ticks)",
 			"description": "Predictive mode only. How far ahead each prediction runs. 240 ticks = 1 second.",
-			"control": { "slider": true, "arrows": true, "input": true }
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"input": true
+			}
 		},
 		"hold-ticks": {
 			"type": "int",
@@ -69,16 +84,24 @@
 			"max": 60,
 			"name": "Predictive: assumed hold length (ticks)",
 			"description": "Predictive mode only. How long the prediction assumes you hold each click before releasing.",
-			"control": { "slider": true, "arrows": true, "input": true }
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"input": true
+			}
 		},
 		"time-budget-ms": {
 			"type": "int",
-			"default": 20,
+			"default": 10,
 			"min": 1,
 			"max": 100,
-			"name": "Predictive: time budget per click (ms)",
-			"description": "Predictive mode only. If the prediction takes longer than this, your click goes through normally. Too low and the mod silently does nothing.",
-			"control": { "slider": true, "arrows": true, "input": true }
+			"name": "Predictive: time budget per check (ms)",
+			"description": "Predictive mode only. Each safety check (one per tick while a click is held back) is cut off after this long. Too low and the mod can't decide in time.",
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"input": true
+			}
 		},
 		"debug": {
 			"type": "bool",
