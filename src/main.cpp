@@ -21,10 +21,6 @@ namespace pib {
 		bool down;
 	};
 
-	// Survives: ran the whole lookahead alive.
-	// Dies:     clone crashed.
-	// Special:  clone reached a portal/orb/pad/trigger alive (can't simulate past it).
-	// Timeout:  ran out of time budget, result unknown.
 	enum class Outcome { Survives, Dies, Special, Timeout };
 
 	inline const char* name(Outcome o) {
@@ -41,27 +37,35 @@ namespace pib {
 	inline std::deque<Pending> g_queue;
 	inline PlayerObject* g_clone = nullptr;
 	inline GJBaseGameLayer* g_cloneLayer = nullptr;
-	inline int64_t g_updates = 0;   // physics updates of the real player so far
-	inline int64_t g_shift = 0;     // delay applied to the latest click (keeps rhythm)
+	inline int64_t g_updates = 0;
+	inline int64_t g_shift = 0;
 	inline float g_dt = 1.f / 240.f;
-	inline bool g_bypass = false;   // delivering a queued click
+	inline bool g_bypass = false;
 	inline bool g_simulating = false;
 	inline bool g_cloneDied = false;
 	inline bool g_cloneTouchedSpecial = false;
-	inline bool g_tickSeen = false; // probe: has the update hook run in this level?
+	inline bool g_tickSeen = false;
 	inline std::string g_lastReason;
 
 	// ---- classic state ----
-	inline bool g_held = false;          // is the player physically holding the button
-	inline bool g_classicPending = false;// a click is waiting for the ground
-	inline int g_classicLeft = 0;        // ticks left in the buffer window
-	inline int g_classicReleaseIn = 0;   // ticks until we let go of a click we fired
+	inline bool g_held = false;
+	inline bool g_classicPending = false;
+	inline int g_classicLeft = 0;
+	inline int g_classicReleaseIn = 0;
 
 	// ---- predictive "hold and wait" state ----
-	inline bool g_pendingPress = false;     // a click is being held back, waiting for a safe moment
-	inline int64_t g_pendingSince = 0;      // g_updates when the click was made
-	inline bool g_pendingReleased = false;  // player let go while it was waiting
-	inline int64_t g_pendingHold = 0;       // how long the player held the click (ticks)
+	inline bool g_pendingPress = false;
+	inline int64_t g_pendingSince = 0;
+	inline bool g_pendingReleased = false;
+	inline int64_t g_pendingHold = 0;
+
+	// ---- real input tracking (wave + orb assist) ----
+	inline bool g_userDown = false;
+	inline bool g_actualDown = false;
+	inline int64_t g_userPressTick = -1000000;
+	inline bool g_orbArmed = false;
+	inline int g_releaseIn = 0;
+	inline bool g_wavePrev = false;
 
 	inline bool enabled() {
 		return Mod::get()->getSettingValue<bool>("enabled");
@@ -84,14 +88,23 @@ namespace pib {
 	inline int64_t budgetMs() {
 		return Mod::get()->getSettingValue<int64_t>("time-budget-ms");
 	}
-	inline bool waveRelease() {
-		return Mod::get()->getSettingValue<bool>("wave-release");
-	}
 	inline bool noclip() {
 		return Mod::get()->getSettingValue<bool>("noclip");
 	}
 	inline bool waveEnabled() {
 		return Mod::get()->getSettingValue<bool>("wave-enabled");
+	}
+	inline int64_t waveLookahead() {
+		return std::max<int64_t>(8, Mod::get()->getSettingValue<int64_t>("wave-lookahead-ticks"));
+	}
+	inline int64_t waveReact() {
+		return std::max<int64_t>(2, Mod::get()->getSettingValue<int64_t>("wave-react-ticks"));
+	}
+	inline bool orbAssistOn() {
+		return Mod::get()->getSettingValue<bool>("orb-assist");
+	}
+	inline int64_t orbWindow() {
+		return std::max<int64_t>(2, Mod::get()->getSettingValue<int64_t>("orb-window-ticks"));
 	}
 	inline bool practiceOnly() {
 		return Mod::get()->getSettingValue<bool>("practice-only");
@@ -100,7 +113,6 @@ namespace pib {
 		return Mod::get()->getSettingValue<bool>("debug");
 	}
 
-	// Log + short on-screen message (only call outside of simulation).
 	inline void say(std::string const& msg, float secs = 0.9f) {
 		log::info("{}", msg);
 		Notification::create(msg, NotificationIcon::None, secs)->show();
@@ -111,7 +123,6 @@ namespace pib {
 	}
 
 	inline bool groundMode(PlayerObject* p) {
-		// Ship, UFO, wave and swing don't need to land to click.
 		return !(p->m_isShip || p->m_isBird || p->m_isDart || p->m_isSwing);
 	}
 
@@ -130,6 +141,12 @@ namespace pib {
 		g_pendingPress = false;
 		g_pendingReleased = false;
 		g_pendingHold = 0;
+		g_userDown = false;
+		g_actualDown = false;
+		g_userPressTick = -1000000;
+		g_orbArmed = false;
+		g_releaseIn = 0;
+		g_wavePrev = false;
 	}
 
 	inline void releaseClone() {
@@ -140,7 +157,6 @@ namespace pib {
 		g_cloneLayer = nullptr;
 	}
 
-	// The clone is tied to the layer it was created for; rebuild it if the layer changed.
 	inline bool ensureClone(GJBaseGameLayer* layer) {
 		if (g_clone && g_cloneLayer == layer) return true;
 		releaseClone();
@@ -152,7 +168,6 @@ namespace pib {
 		return true;
 	}
 
-	// nullptr = predictions are active; otherwise why they are skipped.
 	inline const char* inactiveReason(PlayLayer* pl) {
 		if (!enabled()) return "disabled in settings";
 		if (!pl || !pl->m_player1) return "no player";
@@ -163,13 +178,19 @@ namespace pib {
 		return nullptr;
 	}
 
+	// Send a button state to the game, bypassing our own hook.
+	inline void deliver(PlayLayer* pl, bool down) {
+		g_bypass = true;
+		pl->handleButton(down, 1, true);
+		g_bypass = false;
+		g_actualDown = down;
+	}
+
 	inline void flush(PlayLayer* pl) {
 		while (!g_queue.empty()) {
 			auto e = g_queue.front();
 			g_queue.pop_front();
-			g_bypass = true;
-			pl->handleButton(e.down, 1, true);
-			g_bypass = false;
+			deliver(pl, e.down);
 		}
 	}
 
@@ -181,7 +202,6 @@ namespace pib {
 		return true;
 	}
 
-	// Called every physics tick of the real player (classic mode only).
 	inline void classicTick(PlayLayer* pl, PlayerObject* p) {
 		if (!classicMode()) {
 			g_classicPending = false;
@@ -189,11 +209,8 @@ namespace pib {
 			return;
 		}
 
-		// let go of a click we fired for a player who had already released
 		if (g_classicReleaseIn > 0 && --g_classicReleaseIn == 0 && !g_held) {
-			g_bypass = true;
-			pl->handleButton(false, 1, true);
-			g_bypass = false;
+			deliver(pl, false);
 		}
 
 		if (!g_classicPending) return;
@@ -205,11 +222,9 @@ namespace pib {
 
 		if (p->m_isOnGround && groundMode(p)) {
 			g_classicPending = false;
-			g_bypass = true;
-			if (g_held) pl->handleButton(false, 1, true); // re-click cleanly
-			pl->handleButton(true, 1, true);
-			g_bypass = false;
-			if (!g_held) g_classicReleaseIn = 3;           // short tap
+			if (g_held) deliver(pl, false);
+			deliver(pl, true);
+			if (!g_held) g_classicReleaseIn = 3;
 			if (debugOn()) say("PIB classic: click delivered on landing");
 			return;
 		}
@@ -219,7 +234,6 @@ namespace pib {
 
 	// ---------------- predictive buffer ----------------
 
-	// Copy the real player's physics state onto the hidden clone.
 	inline void syncClone(PlayerObject* real) {
 		auto* c = g_clone;
 		c->copyAttributes(real);
@@ -246,8 +260,6 @@ namespace pib {
 		c->releaseAllButtons();
 	}
 
-	// Run the clone forward. Press event: click at tick `delay`, hold briefly, release.
-	// Release event: button starts held, released at tick `delay`.
 	inline Outcome simulate(
 		GJBaseGameLayer* layer, PlayerObject* real, int64_t delay,
 		bool pressEvent, Clock::time_point deadline
@@ -284,64 +296,6 @@ namespace pib {
 		return result;
 	}
 
-	// 0 = leave the input alone; otherwise the earliest delay (in ticks) that survives.
-	inline int64_t chooseDelay(GJBaseGameLayer* layer, PlayerObject* real, bool pressEvent) {
-		if (!ensureClone(layer)) {
-			if (debugOn()) say("PIB: could not create clone");
-			return 0;
-		}
-		auto start = Clock::now();
-		auto deadline = start + std::chrono::milliseconds(budgetMs());
-		auto elapsed = [&]() {
-			return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-		};
-		const char* kind = pressEvent ? "press" : "release";
-
-		// Only intervene if the unmodified input is known to kill.
-		auto r0 = simulate(layer, real, 0, pressEvent, deadline);
-		if (r0 != Outcome::Dies) {
-			if (debugOn()) {
-				say(fmt::format("PIB {}: now {} -> pass through ({:.1f}ms of {}ms)",
-					kind, name(r0), elapsed(), budgetMs()));
-			}
-			return 0;
-		}
-
-		int64_t maxTicks = maxDelayTicks();
-		Outcome last = Outcome::Dies;
-		for (int64_t d = 1; d <= maxTicks; ++d) {
-			if (Clock::now() > deadline) {
-				if (debugOn()) {
-					say(fmt::format("PIB {}: budget ran out at d={} ({:.1f}ms) - raise time budget",
-						kind, d, elapsed()));
-				}
-				return 0;
-			}
-			auto r = simulate(layer, real, d, pressEvent, deadline);
-			last = r;
-			if (r == Outcome::Timeout) {
-				if (debugOn()) {
-					say(fmt::format("PIB {}: sim timeout at d={} ({:.1f}ms) - raise time budget",
-						kind, d, elapsed()));
-				}
-				return 0;
-			}
-			// Reaching a special object alive still beats a delay-0 death.
-			if (r == Outcome::Survives || r == Outcome::Special) {
-				if (debugOn()) {
-					say(fmt::format("PIB {}: dies now, d={} {} -> delaying ({:.1f}ms)",
-						kind, d, name(r), elapsed()));
-				}
-				return d;
-			}
-		}
-		if (debugOn()) {
-			say(fmt::format("PIB {}: dies now, no fix within {} ticks (last: {})",
-				kind, maxTicks, name(last)));
-		}
-		return 0;
-	}
-	// Click just happened: would it kill us right now? If so, the click is held back.
 	inline bool shouldHold(GJBaseGameLayer* layer, PlayerObject* real) {
 		if (!ensureClone(layer)) {
 			if (debugOn()) say("PIB: could not create clone");
@@ -361,17 +315,12 @@ namespace pib {
 		return false;
 	}
 
-	// Runs once per physics tick while a click is being held back.
-	// Fires the click at the first tick where it no longer kills us.
 	inline void tickPending(PlayLayer* pl, PlayerObject* p) {
 		int64_t waited = g_updates - g_pendingSince;
 		bool fire = false;
 		std::string why;
 
-		if (p->m_isDart && !waveEnabled()) {
-			fire = true;
-			why = "wave (prediction off)";
-		} else if (waited >= maxDelayTicks()) {
+		if (waited >= maxDelayTicks()) {
 			fire = true;
 			why = "wait limit reached";
 		} else {
@@ -386,18 +335,14 @@ namespace pib {
 					fire = true;
 					why = fmt::format("safe ({})", name(r));
 				}
-				// Dies or Timeout: keep waiting
 			}
 		}
 
 		if (!fire) return;
 
 		g_pendingPress = false;
-		g_bypass = true;
-		pl->handleButton(true, 1, true);
-		g_bypass = false;
+		deliver(pl, true);
 
-		// If the player already let go, release after the same hold length.
 		if (g_pendingReleased) {
 			int64_t hold = std::max<int64_t>(1, g_pendingHold);
 			g_queue.push_back({g_updates + hold, false});
@@ -406,14 +351,108 @@ namespace pib {
 
 		if (debugOn()) say(fmt::format("PIB: click delivered after {} ticks - {}", waited, why));
 	}
+
+	// ---------------- wave controller ----------------
+
+	// Run the clone with a wave plan: hold the opposite of `want` for `flip` ticks,
+	// then follow `want` for the rest. flip = 0 means just follow `want`.
+	inline Outcome simulateWave(
+		GJBaseGameLayer* layer, PlayerObject* real, bool want, int64_t flip,
+		int64_t total, Clock::time_point deadline, int64_t& diedAt
+	) {
+		syncClone(real);
+		g_cloneDied = false;
+		g_cloneTouchedSpecial = false;
+		g_simulating = true;
+		diedAt = -1;
+
+		bool held = false;
+		Outcome result = Outcome::Survives;
+
+		for (int64_t t = 0; t < total; ++t) {
+			bool state = (t < flip) ? !want : want;
+			if (state != held) {
+				held = state;
+				if (held) g_clone->pushButton(PlayerButton::Jump);
+				else g_clone->releaseButton(PlayerButton::Jump);
+			}
+
+			g_clone->update(g_dt);
+			layer->checkCollisions(g_clone, g_dt, false);
+
+			if (g_cloneDied) { result = Outcome::Dies; diedAt = t; break; }
+			if (g_cloneTouchedSpecial) { result = Outcome::Special; break; }
+			if ((t & 7) == 7 && Clock::now() > deadline) { result = Outcome::Timeout; break; }
+		}
+
+		g_simulating = false;
+		g_clone->releaseAllButtons();
+		return result;
+	}
+
+	// Runs every physics tick while the player is a wave. Chooses what the
+	// button should actually be doing this tick.
+	inline void waveTick(PlayLayer* pl, PlayerObject* p) {
+		bool want = g_userDown;
+		bool decide = want;
+		auto* layer = static_cast<GJBaseGameLayer*>(pl);
+
+		if (ensureClone(layer)) {
+			auto deadline = Clock::now() + std::chrono::milliseconds(budgetMs());
+			int64_t total = waveLookahead();
+			int64_t died = -1;
+
+			auto r = simulateWave(layer, p, want, 0, total, deadline, died);
+			// Only take over when death is close, so your own line is kept when it is safe.
+			if (r == Outcome::Dies && died <= waveReact()) {
+				static const int64_t flips[] = {1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 48};
+				for (auto f : flips) {
+					if (f > total) break;
+					if (Clock::now() > deadline) break;
+					int64_t d2 = -1;
+					auto r2 = simulateWave(layer, p, want, f, total, deadline, d2);
+					if (r2 == Outcome::Survives || r2 == Outcome::Special) {
+						decide = !want;
+						if (debugOn()) say(fmt::format("PIB wave: flip {} ticks", f), 0.4f);
+						break;
+					}
+				}
+			}
+		}
+
+		if (g_actualDown != decide) deliver(pl, decide);
+	}
+
+	// ---------------- orb assist ----------------
+
+	// Called when the real player touches an orb. If a click was made a little
+	// earlier, fire a fresh click right now so the orb activates.
+	inline void orbAssist(PlayerObject* player) {
+		auto* pl = PlayLayer::get();
+		if (!pl || player != pl->m_player1) return;
+		if (!g_orbArmed || !enabled() || !orbAssistOn()) return;
+		if (practiceOnly() && !pl->m_isPracticeMode) return;
+		if (player->m_isDart) return;
+
+		int64_t age = g_updates - g_userPressTick;
+		if (age < 2 || age > orbWindow()) return;
+
+		g_orbArmed = false;
+		g_bypass = true;
+		pl->handleButton(false, 1, true);
+		pl->handleButton(true, 1, true);
+		g_bypass = false;
+		g_actualDown = true;
+		if (!g_userDown) g_releaseIn = 3;
+		if (debugOn()) say(fmt::format("PIB orb: click re-fired ({} ticks early)", age), 0.5f);
+	}
 }
 
-// Probe 1: proves this exact build is installed and loaded (label on the main menu).
 class $modify(PIBMenu, MenuLayer) {
 	bool init() {
 		if (!MenuLayer::init()) return false;
 		auto size = CCDirector::sharedDirector()->getWinSize();
-		auto* label = CCLabelBMFont::create("PIB v0.6.3 loaded", "bigFont.fnt");
+		auto* label = CCLabelBMFont::create("PIB v0.7.0 loaded", "bigFont.fnt");
 		label->setScale(0.4f);
 		label->setPosition({ size.width / 2.f, 12.f });
 		label->setZOrder(100);
@@ -433,14 +472,20 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 			return;
 		}
 
-		// ---- classic mode: click always goes through, and is also remembered ----
+		// A real input from the player: remember it.
+		pib::g_userDown = down;
+		if (down) {
+			pib::g_userPressTick = pib::g_updates;
+			pib::g_orbArmed = true;
+		}
+
+		// ---- classic mode ----
 		if (pib::classicMode()) {
-			pib::flush(pl); // in case the mode was switched mid-level
+			pib::flush(pl);
 			pib::g_pendingPress = false;
 			auto* p = pl->m_player1;
-			// Decide BEFORE the click is applied, otherwise a normal ground jump
-			// would look like an air click.
 			bool arm = down && pib::classicActive(pl) && pib::groundMode(p) && !p->m_isOnGround;
+			pib::g_actualDown = down;
 			GJBaseGameLayer::handleButton(down, button, isPlayer1);
 			pib::g_held = down;
 			if (arm) {
@@ -458,6 +503,7 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 			}
 			pib::flush(pl);
 			pib::g_pendingPress = false;
+			pib::g_actualDown = down;
 			GJBaseGameLayer::handleButton(down, button, isPlayer1);
 			return;
 		}
@@ -466,17 +512,21 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 		auto* player = pl->m_player1;
 		int64_t delay = 0;
 
-		// The wave is not modelled correctly by the simulation, so by default
-		// every wave input goes straight through untouched.
-		if (player->m_isDart && !pib::waveEnabled()) {
+		// Wave: the controller owns the button. We only record what the player wants;
+		// the controller applies it (or a safe correction) on the next physics tick.
+		if (player->m_isDart) {
 			pib::flush(pl);
 			pib::g_pendingPress = false;
 			pib::g_shift = 0;
-			GJBaseGameLayer::handleButton(down, button, isPlayer1);
+			if (!pib::waveEnabled()) {
+				pib::g_actualDown = down;
+				GJBaseGameLayer::handleButton(down, button, isPlayer1);
+				return;
+			}
+			pib::g_wavePrev = true;
 			return;
 		}
 
-		// A click is already being held back: just remember what the player does with it.
 		if (pib::g_pendingPress) {
 			if (down) {
 				pib::g_pendingReleased = false;
@@ -488,11 +538,10 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 		}
 
 		if (!pib::g_queue.empty()) {
-			delay = pib::g_shift;                       // something is waiting: keep the rhythm
+			delay = pib::g_shift;
 		} else if (down) {
 			pib::g_shift = 0;
 			if (pib::shouldHold(self, player)) {
-				// This click would kill us: swallow it and wait for a safe moment.
 				pib::g_pendingPress = true;
 				pib::g_pendingSince = pib::g_updates;
 				pib::g_pendingReleased = false;
@@ -500,14 +549,12 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 				return;
 			}
 			delay = 0;
-		} else if (player->m_isDart && pib::waveRelease()) {
-			delay = pib::chooseDelay(self, player, false);
-			pib::g_shift = delay;
 		} else {
-			delay = pib::g_shift;                       // keep the hold length of a delayed press
+			delay = pib::g_shift;
 		}
 
 		if (delay <= 0 && pib::g_queue.empty()) {
+			pib::g_actualDown = down;
 			GJBaseGameLayer::handleButton(down, button, isPlayer1);
 			return;
 		}
@@ -517,13 +564,13 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 		pib::g_queue.push_back({fire, down});
 	}
 
-	// Things the hidden clone must never do to the real level.
 	bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
 		if (pib::isClone(player)) { pib::g_cloneTouchedSpecial = true; return false; }
 		return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
 	}
 	void playerTouchedRing(PlayerObject* player, RingObject* object) {
 		if (pib::isClone(player)) { pib::g_cloneTouchedSpecial = true; return; }
+		if (!pib::g_simulating) pib::orbAssist(player);
 		GJBaseGameLayer::playerTouchedRing(player, object);
 	}
 	void playerTouchedTrigger(PlayerObject* player, EffectGameObject* object) {
@@ -561,7 +608,6 @@ class $modify(PIBPlayer, PlayerObject) {
 		auto* pl = PlayLayer::get();
 		PlayerObject* self = this;
 		if (pl && self == pl->m_player1 && !pib::isClone(self)) {
-			// Probe 2: proves the PlayerObject::update hook runs inside a level.
 			if (!pib::g_tickSeen) {
 				pib::g_tickSeen = true;
 				if (pib::debugOn()) {
@@ -574,18 +620,38 @@ class $modify(PIBPlayer, PlayerObject) {
 				}
 			}
 
-			if (dt > 0.f) pib::g_dt = dt;
+			// Ignore lag-spike dt values so the simulation keeps matching the real step.
+			if (dt >= 0.001f && dt <= 1.f / 120.f) pib::g_dt = dt;
 
-			// a held-back click: fire it at the first safe tick
-			if (pib::g_pendingPress) pib::tickPending(pl, self);
+			bool predictive = !pib::classicMode() && pib::inactiveReason(pl) == nullptr;
+			bool waveManaged = predictive && self->m_isDart && pib::waveEnabled();
 
-			// deliver delayed clicks at the start of their tick (predictive mode)
+			if (waveManaged) {
+				pib::g_pendingPress = false;
+			} else {
+				// leaving the wave: give the game the real finger state back
+				if (pib::g_wavePrev) {
+					pib::g_wavePrev = false;
+					if (pib::g_actualDown != pib::g_userDown) pib::deliver(pl, pib::g_userDown);
+				}
+				if (pib::g_pendingPress) pib::tickPending(pl, self);
+			}
+
+			// delayed clicks
 			while (!pib::g_queue.empty() && pib::g_queue.front().fireAt <= pib::g_updates) {
 				auto e = pib::g_queue.front();
 				pib::g_queue.pop_front();
-				pib::g_bypass = true;
-				pl->handleButton(e.down, 1, true);
-				pib::g_bypass = false;
+				pib::deliver(pl, e.down);
+			}
+
+			// let go of an orb re-press if the finger is already up
+			if (pib::g_releaseIn > 0 && --pib::g_releaseIn == 0 && !pib::g_userDown) {
+				pib::deliver(pl, false);
+			}
+
+			if (waveManaged) {
+				pib::g_wavePrev = true;
+				pib::waveTick(pl, self);
 			}
 
 			PlayerObject::update(dt);
@@ -608,6 +674,34 @@ class $modify(PIBPlayer, PlayerObject) {
 };
 
 class $modify(PIBPlayLayer, PlayLayer) {
+	void setupHasCompleted() {
+		PlayLayer::setupHasCompleted();
+
+		auto size = CCDirector::sharedDirector()->getWinSize();
+		bool on = pib::noclip();
+		auto* label = CCLabelBMFont::create(on ? "NC: ON" : "NC: OFF", "bigFont.fnt");
+		label->setScale(0.35f);
+		label->setOpacity(150);
+		label->setID("pib-nc-label");
+		auto* btn = CCMenuItemSpriteExtra::create(
+			label, this, menu_selector(PIBPlayLayer::onNoclipBtn)
+		);
+		auto* menu = CCMenu::create();
+		menu->addChild(btn);
+		menu->setPosition({ 38.f, size.height - 14.f });
+		this->addChild(menu, 100);
+	}
+
+	void onNoclipBtn(CCObject*) {
+		bool now = !pib::noclip();
+		Mod::get()->setSettingValue<bool>("noclip", now);
+		if (auto* node = this->getChildByIDRecursive("pib-nc-label")) {
+			if (auto* label = typeinfo_cast<CCLabelBMFont*>(node)) {
+				label->setString(now ? "NC: ON" : "NC: OFF");
+			}
+		}
+	}
+
 	void resetLevel() {
 		pib::resetRuntime();
 		PlayLayer::resetLevel();
@@ -622,11 +716,11 @@ class $modify(PIBPlayLayer, PlayLayer) {
 
 	void destroyPlayer(PlayerObject* player, GameObject* object) {
 		if (pib::isClone(player)) {
-			pib::g_cloneDied = true;   // the clone crashed: record it, never run the real death
+			pib::g_cloneDied = true;
 			return;
 		}
-		// Noclip: ignore normal deaths. The anti-cheat spike is still allowed to kill.
-		if (pib::noclip() && object != m_anticheatSpike) return;
+		// Noclip: plain toggle, ignores every death.
+		if (pib::noclip()) return;
 		PlayLayer::destroyPlayer(player, object);
 	}
 };
