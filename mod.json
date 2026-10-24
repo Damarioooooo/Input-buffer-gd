@@ -5,25 +5,86 @@
 		"ios": "2.2081"
 	},
 	"id": "cesar.input-buffer",
-	"name": "Input Buffer",
-	"version": "v1.0.0",
+	"name": "Predictive Input Buffer",
+	"version": "v0.6.0",
 	"developer": "CesarGD96",
-	"description": "If you click shortly before landing, the click is remembered and fired the moment you touch the ground.",
+	"description": "Two buffer modes. Predictive: if clicking now would kill you and a slightly later click survives, your click is held back and delivered later. Classic: a click made in the air is remembered and fired when you land.",
 	"settings": {
 		"enabled": {
 			"type": "bool",
 			"default": true,
-			"name": "Enable Input Buffer",
-			"description": "Turn the buffer on or off."
+			"name": "Enable Buffer",
+			"description": "Turn the buffer on or off without restarting."
 		},
-		"buffer-ticks": {
+		"mode": {
+			"type": "string",
+			"default": "Predictive",
+			"one-of": ["Predictive", "Classic"],
+			"name": "Buffer mode",
+			"description": "Predictive: holds back a click that would kill you and fires its own at a moment that survives. Classic: remembers a click made in the air and fires it when you land."
+		},
+		"classic-ticks": {
+			"type": "int",
+			"default": 12,
+			"min": 1,
+			"max": 240,
+			"name": "Classic: buffer window (ticks)",
+			"description": "Classic mode only. How long before landing a click is remembered. 4 ticks = 1 frame at 60 FPS, 240 ticks = 1 second. High values feel like the mod is clicking for you.",
+			"control": { "slider": true, "arrows": true, "input": true }
+		},
+		"practice-only": {
+			"type": "bool",
+			"default": false,
+			"name": "Practice mode only",
+			"description": "Only act in practice mode."
+		},
+		"wave-release": {
+			"type": "bool",
+			"default": true,
+			"name": "Predictive: predict wave releases",
+			"description": "Predictive mode only. Also hold back wave releases that would crash."
+		},
+		"max-delay-frames": {
+			"type": "int",
+			"default": 4,
+			"min": 1,
+			"max": 100,
+			"name": "Predictive: maximum delay (frames)",
+			"description": "Predictive mode only. The most a click may be held back. 1 frame = 4 physics ticks at 60 FPS.",
+			"control": { "slider": true, "arrows": true, "input": true }
+		},
+		"lookahead-ticks": {
+			"type": "int",
+			"default": 90,
+			"min": 30,
+			"max": 240,
+			"name": "Predictive: look-ahead (ticks)",
+			"description": "Predictive mode only. How far ahead each prediction runs. 240 ticks = 1 second.",
+			"control": { "slider": true, "arrows": true, "input": true }
+		},
+		"hold-ticks": {
 			"type": "int",
 			"default": 8,
 			"min": 1,
 			"max": 60,
-			"name": "Buffer window (ticks)",
-			"description": "How long before landing a click is remembered. 4 ticks = 1 frame at 60 FPS (240 ticks = 1 second).",
+			"name": "Predictive: assumed hold length (ticks)",
+			"description": "Predictive mode only. How long the prediction assumes you hold each click before releasing.",
 			"control": { "slider": true, "arrows": true, "input": true }
+		},
+		"time-budget-ms": {
+			"type": "int",
+			"default": 20,
+			"min": 1,
+			"max": 100,
+			"name": "Predictive: time budget per click (ms)",
+			"description": "Predictive mode only. If the prediction takes longer than this, your click goes through normally. Too low and the mod silently does nothing.",
+			"control": { "slider": true, "arrows": true, "input": true }
+		},
+		"debug": {
+			"type": "bool",
+			"default": true,
+			"name": "Debug messages",
+			"description": "Show a short on-screen message for every click explaining what the buffer decided."
 		}
 	}
 }
