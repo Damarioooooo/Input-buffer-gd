@@ -6,9 +6,9 @@
 	},
 	"id": "cesar.input-buffer",
 	"name": "Predictive Input Buffer",
-	"version": "v0.6.3",
+	"version": "v0.7.0",
 	"developer": "CesarGD96",
-	"description": "Two buffer modes. Predictive: if clicking now would kill you, your click is held back and the mod fires its own click at the first moment that survives. Classic: a click made in the air is remembered and fired when you land.",
+	"description": "Two buffer modes. Predictive: if clicking now would kill you, your click is held back and the mod fires its own click at the first moment that survives. Classic: a click made in the air is remembered and fired when you land. Includes per-tick wave correction, orb assist and a noclip toggle.",
 	"settings": {
 		"enabled": {
 			"type": "bool",
@@ -20,7 +20,7 @@
 			"type": "bool",
 			"default": false,
 			"name": "Noclip",
-			"description": "You can't die to spikes, blocks or saws. For practice only."
+			"description": "You can't die to spikes, blocks or saws. Also toggleable with the NC button in the top-left of a level."
 		},
 		"mode": {
 			"type": "string",
@@ -38,7 +38,7 @@
 			"min": 1,
 			"max": 240,
 			"name": "Classic: buffer window (ticks)",
-			"description": "Classic mode only. How long before landing a click is remembered. 4 ticks = 1 frame at 60 FPS, 240 ticks = 1 second. High values feel like the mod is clicking for you.",
+			"description": "Classic mode only. How long before landing a click is remembered. 4 ticks = 1 frame at 60 FPS, 240 ticks = 1 second.",
 			"control": {
 				"slider": true,
 				"arrows": true,
@@ -51,17 +51,56 @@
 			"name": "Practice mode only",
 			"description": "Only act in practice mode."
 		},
-		"wave-release": {
-			"type": "bool",
-			"default": true,
-			"name": "Predictive: predict wave releases",
-			"description": "Predictive mode only. Also hold back wave releases that would crash."
-		},
 		"wave-enabled": {
 			"type": "bool",
-			"default": false,
-			"name": "Predictive: use in wave",
-			"description": "Predictive mode only. Off by default: the simulation does not model the wave well, so with this on it may hold clicks back for no reason. When off, all wave inputs pass through untouched."
+			"default": true,
+			"name": "Wave assist",
+			"description": "Predictive mode only. Checks the wave every physics tick and corrects holds and releases that would hit a spike or block. Your input is left alone when it is safe."
+		},
+		"wave-lookahead-ticks": {
+			"type": "int",
+			"default": 48,
+			"min": 8,
+			"max": 240,
+			"name": "Wave: look-ahead (ticks)",
+			"description": "How far ahead the wave controller simulates each tick. Lower this if the game stutters in wave.",
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"input": true
+			}
+		},
+		"wave-react-ticks": {
+			"type": "int",
+			"default": 24,
+			"min": 2,
+			"max": 120,
+			"name": "Wave: react window (ticks)",
+			"description": "The wave only overrides you when death is within this many ticks. Higher = earlier saves, but it takes over more often.",
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"input": true
+			}
+		},
+		"orb-assist": {
+			"type": "bool",
+			"default": true,
+			"name": "Orb assist",
+			"description": "If you click shortly before an orb, the mod re-presses the button the moment you touch it."
+		},
+		"orb-window-ticks": {
+			"type": "int",
+			"default": 48,
+			"min": 2,
+			"max": 240,
+			"name": "Orb: early click window (ticks)",
+			"description": "How early before an orb a click still counts.",
+			"control": {
+				"slider": true,
+				"arrows": true,
+				"input": true
+			}
 		},
 		"max-delay-frames": {
 			"type": "int",
@@ -69,7 +108,7 @@
 			"min": 1,
 			"max": 100,
 			"name": "Predictive: maximum wait (frames)",
-			"description": "Predictive mode only. The longest a click may be held back while waiting for a safe moment. Raise this to be able to click very early. 1 frame = 4 physics ticks at 60 FPS.",
+			"description": "Predictive mode only. The longest a click may be held back while waiting for a safe moment. 1 frame = 4 physics ticks at 60 FPS.",
 			"control": {
 				"slider": true,
 				"arrows": true,
@@ -108,7 +147,7 @@
 			"min": 1,
 			"max": 100,
 			"name": "Predictive: time budget per check (ms)",
-			"description": "Predictive mode only. Each safety check (one per tick while a click is held back) is cut off after this long. Too low and the mod can't decide in time.",
+			"description": "Each safety check is cut off after this long. Too low and the mod can't decide in time; too high and the game may stutter.",
 			"control": {
 				"slider": true,
 				"arrows": true,
@@ -119,7 +158,7 @@
 			"type": "bool",
 			"default": true,
 			"name": "Debug messages",
-			"description": "Show a short on-screen message for every click explaining what the buffer decided."
+			"description": "Show a short on-screen message for every decision the buffer makes."
 		}
 	}
 }
