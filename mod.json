@@ -6,7 +6,7 @@
 	},
 	"id": "cesar.input-buffer",
 	"name": "Predictive Input Buffer",
-	"version": "v0.6.1",
+	"version": "v0.6.3",
 	"developer": "CesarGD96",
 	"description": "Two buffer modes. Predictive: if clicking now would kill you, your click is held back and the mod fires its own click at the first moment that survives. Classic: a click made in the air is remembered and fired when you land.",
 	"settings": {
@@ -15,6 +15,12 @@
 			"default": true,
 			"name": "Enable Buffer",
 			"description": "Turn the buffer on or off without restarting."
+		},
+		"noclip": {
+			"type": "bool",
+			"default": false,
+			"name": "Noclip",
+			"description": "You can't die to spikes, blocks or saws. For practice only."
 		},
 		"mode": {
 			"type": "string",
@@ -50,6 +56,12 @@
 			"default": true,
 			"name": "Predictive: predict wave releases",
 			"description": "Predictive mode only. Also hold back wave releases that would crash."
+		},
+		"wave-enabled": {
+			"type": "bool",
+			"default": false,
+			"name": "Predictive: use in wave",
+			"description": "Predictive mode only. Off by default: the simulation does not model the wave well, so with this on it may hold clicks back for no reason. When off, all wave inputs pass through untouched."
 		},
 		"max-delay-frames": {
 			"type": "int",
