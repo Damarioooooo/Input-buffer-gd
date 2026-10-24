@@ -6,7 +6,7 @@
 	},
 	"id": "cesar.input-buffer",
 	"name": "Predictive Input Buffer",
-	"version": "v0.7.0",
+	"version": "v0.7.1",
 	"developer": "CesarGD96",
 	"description": "Two buffer modes. Predictive: if clicking now would kill you, your click is held back and the mod fires its own click at the first moment that survives. Classic: a click made in the air is remembered and fired when you land. Includes per-tick wave correction, orb assist and a noclip toggle.",
 	"settings": {
@@ -18,7 +18,7 @@
 		},
 		"noclip": {
 			"type": "bool",
-			"default": false,
+			"default": true,
 			"name": "Noclip",
 			"description": "You can't die to spikes, blocks or saws. Also toggleable with the NC button in the top-left of a level."
 		},
@@ -59,7 +59,7 @@
 		},
 		"wave-lookahead-ticks": {
 			"type": "int",
-			"default": 48,
+			"default": 96,
 			"min": 8,
 			"max": 240,
 			"name": "Wave: look-ahead (ticks)",
@@ -72,7 +72,7 @@
 		},
 		"wave-react-ticks": {
 			"type": "int",
-			"default": 24,
+			"default": 60,
 			"min": 2,
 			"max": 120,
 			"name": "Wave: react window (ticks)",
@@ -91,7 +91,7 @@
 		},
 		"orb-window-ticks": {
 			"type": "int",
-			"default": 48,
+			"default": 240,
 			"min": 2,
 			"max": 240,
 			"name": "Orb: early click window (ticks)",
@@ -104,9 +104,9 @@
 		},
 		"max-delay-frames": {
 			"type": "int",
-			"default": 12,
+			"default": 250,
 			"min": 1,
-			"max": 100,
+			"max": 250,
 			"name": "Predictive: maximum wait (frames)",
 			"description": "Predictive mode only. The longest a click may be held back while waiting for a safe moment. 1 frame = 4 physics ticks at 60 FPS.",
 			"control": {
@@ -117,7 +117,7 @@
 		},
 		"lookahead-ticks": {
 			"type": "int",
-			"default": 90,
+			"default": 240,
 			"min": 30,
 			"max": 240,
 			"name": "Predictive: look-ahead (ticks)",
@@ -143,7 +143,7 @@
 		},
 		"time-budget-ms": {
 			"type": "int",
-			"default": 10,
+			"default": 15,
 			"min": 1,
 			"max": 100,
 			"name": "Predictive: time budget per check (ms)",
@@ -156,7 +156,7 @@
 		},
 		"debug": {
 			"type": "bool",
-			"default": true,
+			"default": false,
 			"name": "Debug messages",
 			"description": "Show a short on-screen message for every decision the buffer makes."
 		}
