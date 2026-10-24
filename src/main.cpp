@@ -60,6 +60,8 @@ namespace pib {
 	inline int64_t g_pendingSince = 0;
 	inline bool g_pendingReleased = false;
 	inline int64_t g_pendingHold = 0;
+	inline bool g_pendingGrounded = false;   // pending click has seen the ground since being buffered
+	inline int64_t g_groundSince = 0;        // tick the player first became grounded while pending
 
 	// ---- real input tracking (wave + orb assist) ----
 	inline bool g_userDown = false;
@@ -159,6 +161,8 @@ namespace pib {
 		g_pendingPress = false;
 		g_pendingReleased = false;
 		g_pendingHold = 0;
+		g_pendingGrounded = false;
+		g_groundSince = 0;
 		g_userDown = false;
 		g_actualDown = false;
 		g_userPressTick = -1000000;
@@ -304,6 +308,10 @@ namespace pib {
 		layer->checkCollisions(g_clone, g_dt, false);
 	}
 
+	// FIX: for ground modes the simulation now ends a few ticks after the clone
+	// lands from the press-triggered jump, instead of running a full second in
+	// which it would die to the NEXT obstacle (which needs another click the sim
+	// never makes).
 	inline Outcome simulate(
 		GJBaseGameLayer* layer, PlayerObject* real, int64_t delay,
 		bool pressEvent, Clock::time_point deadline
@@ -319,6 +327,11 @@ namespace pib {
 		if (g_recordTrace) g_trace.clear();
 
 		if (!pressEvent) g_clone->pushButton(PlayerButton::Jump);
+
+		bool ground = groundMode(real);
+		bool left = false;
+		int64_t landedAt = -1;
+		constexpr int64_t kSettle = 8;
 
 		int64_t hold = holdTicks();
 		int64_t total = delay + lookahead();
@@ -339,6 +352,13 @@ namespace pib {
 
 			if (g_cloneDied) { result = Outcome::Dies; break; }
 			if (g_cloneTouchedSpecial) { result = Outcome::Special; break; }
+
+			if (ground && pressEvent && t >= delay) {
+				if (!g_clone->m_isOnGround) left = true;
+				else if (left && landedAt < 0) landedAt = t;
+				if (landedAt >= 0 && t - landedAt >= kSettle) break; // landed and settled: Survives
+			}
+
 			if ((t & 7) == 7 && Clock::now() > deadline) { result = Outcome::Timeout; break; }
 		}
 
@@ -348,6 +368,8 @@ namespace pib {
 		return result;
 	}
 
+	// FIX: Timeout (could not decide in time) now holds the click instead of
+	// letting it through. tickPending will keep re-checking.
 	inline bool shouldHold(GJBaseGameLayer* layer, PlayerObject* real) {
 		if (!ensureClone(layer)) {
 			if (debugOn()) say("PIB: could not create clone");
@@ -358,10 +380,10 @@ namespace pib {
 		auto r0 = simulate(layer, real, 0, true, start + std::chrono::milliseconds(budgetMs()));
 		g_recordTrace = false;
 		double took = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-		if (r0 == Outcome::Dies) {
+		if (r0 == Outcome::Dies || r0 == Outcome::Timeout) {
 			if (debugOn()) {
-				say(fmt::format("PIB press: would die at tick {} -> holding click ({:.1f}ms){}",
-					g_simTicks, took, g_manualX ? " manual-x" : ""), 2.0f);
+				say(fmt::format("PIB press: {} at tick {} -> holding click ({:.1f}ms){}",
+					name(r0), g_simTicks, took, g_manualX ? " manual-x" : ""), 2.0f);
 			}
 			return true;
 		}
@@ -400,25 +422,45 @@ namespace pib {
 		if (g_traceNext >= 3) g_traceActive = false;
 	}
 
+	// FIX: only simulates while grounded, counts the wait from landing (not from
+	// the early click), and releases with the same hold length the sim assumed.
 	inline void tickPending(PlayLayer* pl, PlayerObject* p) {
-		int64_t waited = g_updates - g_pendingSince;
+		bool gm = groundMode(p);
 		bool fire = false;
 		std::string why;
+		int64_t waited = 0;
 
-		if (waited >= maxDelayTicks()) {
+		if (!gm) {
 			fire = true;
-			why = "wait limit reached";
-		} else {
-			auto* layer = static_cast<GJBaseGameLayer*>(pl);
-			if (!ensureClone(layer)) {
+			why = "no longer a ground mode";
+		} else if (!p->m_isOnGround) {
+			g_pendingGrounded = false;
+			if (g_updates - g_pendingSince >= 480) {
 				fire = true;
-				why = "no clone";
+				why = "never landed";
+			}
+		} else {
+			if (!g_pendingGrounded) {
+				g_pendingGrounded = true;
+				g_groundSince = g_updates;
+			}
+			waited = g_updates - g_groundSince;
+
+			if (waited >= maxDelayTicks()) {
+				fire = true;
+				why = "wait limit reached";
 			} else {
-				auto start = Clock::now();
-				auto r = simulate(layer, p, 0, true, start + std::chrono::milliseconds(budgetMs()));
-				if (r == Outcome::Survives || r == Outcome::Special) {
+				auto* layer = static_cast<GJBaseGameLayer*>(pl);
+				if (!ensureClone(layer)) {
 					fire = true;
-					why = fmt::format("safe ({})", name(r));
+					why = "no clone";
+				} else {
+					auto start = Clock::now();
+					auto r = simulate(layer, p, 0, true, start + std::chrono::milliseconds(budgetMs()));
+					if (r == Outcome::Survives || r == Outcome::Special) {
+						fire = true;
+						why = fmt::format("safe ({})", name(r));
+					}
 				}
 			}
 		}
@@ -426,9 +468,13 @@ namespace pib {
 		if (!fire) return;
 
 		g_pendingPress = false;
+		g_pendingGrounded = false;
 		deliver(pl, true);
 
-		if (g_pendingReleased) {
+		if (gm && !p->m_isRobot) {
+			// match the hold length the simulation assumed
+			g_queue.push_back({g_updates + holdTicks(), false});
+		} else if (g_pendingReleased) {
 			int64_t hold = std::max<int64_t>(1, g_pendingHold);
 			g_queue.push_back({g_updates + hold, false});
 		}
@@ -515,6 +561,9 @@ namespace pib {
 		if (age < 2 || age > orbWindow()) return;
 
 		g_orbArmed = false;
+		// FIX: the buffered click was used up by this orb, don't fire it again on landing
+		g_pendingPress = false;
+		g_pendingGrounded = false;
 		g_bypass = true;
 		pl->handleButton(false, 1, true);
 		pl->handleButton(true, 1, true);
@@ -529,7 +578,7 @@ class $modify(PIBMenu, MenuLayer) {
 	bool init() {
 		if (!MenuLayer::init()) return false;
 		auto size = CCDirector::sharedDirector()->getWinSize();
-		auto* label = CCLabelBMFont::create("PIB v0.7.3 loaded", "bigFont.fnt");
+		auto* label = CCLabelBMFont::create("PIB v0.7.4 loaded", "bigFont.fnt");
 		label->setScale(0.4f);
 		label->setPosition({ size.width / 2.f, 12.f });
 		label->setZOrder(100);
@@ -601,6 +650,17 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 			return;
 		}
 
+		// FIX: ship / ufo / swing - the press-and-release model does not apply,
+		// pass the input through untouched.
+		if (!pib::groundMode(player)) {
+			pib::flush(pl);
+			pib::g_pendingPress = false;
+			pib::g_pendingGrounded = false;
+			pib::g_actualDown = down;
+			GJBaseGameLayer::handleButton(down, button, isPlayer1);
+			return;
+		}
+
 		if (pib::g_pendingPress) {
 			if (down) {
 				pib::g_pendingReleased = false;
@@ -615,9 +675,12 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 			delay = pib::g_shift;
 		} else if (down) {
 			pib::g_shift = 0;
-			if (pib::shouldHold(self, player)) {
+			// FIX: a click made in the air is always buffered until landing,
+			// then released at the first safe tick.
+			if (!player->m_isOnGround || pib::shouldHold(self, player)) {
 				pib::g_pendingPress = true;
 				pib::g_pendingSince = pib::g_updates;
+				pib::g_pendingGrounded = false;
 				pib::g_pendingReleased = false;
 				pib::g_pendingHold = 0;
 				return;
