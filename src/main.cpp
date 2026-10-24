@@ -83,6 +83,9 @@ namespace pib {
 	inline int64_t g_simTicks = 0;
 	inline bool g_recordTrace = false;
 	inline std::vector<CCPoint> g_trace;
+	inline bool g_simBroken = false;     // a press never made the clone leave the ground
+	inline std::string g_diag;           // per-tick dump of the first 3 clone ticks
+	inline int g_diagTicks = 0;
 	inline bool g_traceActive = false;
 	inline int64_t g_traceStart = 0;
 	inline int g_traceNext = 0;
@@ -301,24 +304,41 @@ namespace pib {
 	// One physics tick for the clone. If the game's own update did not move the
 	// clone forward, move it by the measured forward speed of the real player.
 	inline void stepClone(GJBaseGameLayer* layer) {
-		float mx0 = g_clone->m_position.x;
-		float nx0 = g_clone->getPositionX();
+		CCPoint m0 = g_clone->m_position;
+		CCPoint n0 = g_clone->getPosition();
 
 		g_clone->update(g_dt);
 
-		bool moved = std::fabs(g_clone->m_position.x - mx0) > 0.0001f
-			|| std::fabs(g_clone->getPositionX() - nx0) > 0.0001f;
-		if (!moved) {
+		// v0.7.6: the old check only looked at whether *something* moved. A frozen
+		// simulation (dx=0 dy=0 over 240 ticks) slipped through it, so the clone never
+		// reached a spike and every early click was judged safe. The clone must
+		// advance by the real player's forward speed every tick, so enforce it:
+		// if x did not advance by about g_realDx in BOTH the physics position and
+		// the node position, set it ourselves.
+		float mdx = g_clone->m_position.x - m0.x;
+		float ndx = g_clone->getPositionX() - n0.x;
+		if (std::fabs(mdx - g_realDx) > 0.05f || std::fabs(ndx - g_realDx) > 0.05f) {
 			g_manualX = true;
-			float nx = mx0 + g_realDx;
+			float nx = m0.x + g_realDx;
 			g_clone->m_position.x = nx;
-			g_clone->setPosition({ nx, g_clone->m_position.y });
+			g_clone->setPosition({ nx, g_clone->getPositionY() });
 		}
 
 		layer->checkCollisions(g_clone, g_dt, false);
 
 		// Some death paths set the flag without going through destroyPlayer.
 		if (g_clone->m_isDead) g_cloneDied = true;
+
+		if (g_recordTrace && g_diagTicks < 3) {
+			g_diagTicks++;
+			g_diag += fmt::format(
+				"[t{} m({:.1f},{:.1f})>({:.1f},{:.1f}) n({:.1f},{:.1f})>({:.1f},{:.1f}) vy={:.2f} gnd={} dead={}] ",
+				g_diagTicks, m0.x, m0.y, g_clone->m_position.x, g_clone->m_position.y,
+				n0.x, n0.y, g_clone->getPositionX(), g_clone->getPositionY(),
+				static_cast<float>(g_clone->m_yVelocity),
+				g_clone->m_isOnGround ? 1 : 0, g_clone->m_isDead ? 1 : 0
+			);
+		}
 	}
 
 	// FIX: for ground modes the simulation now ends a few ticks after the clone
@@ -333,6 +353,9 @@ namespace pib {
 		g_cloneDied = false;
 		g_cloneTouchedSpecial = false;
 		g_manualX = false;
+		g_simBroken = false;
+		g_diag.clear();
+		g_diagTicks = 0;
 		g_simulating = true;
 
 		g_simStart = g_clone->m_position;
@@ -375,6 +398,14 @@ namespace pib {
 			if ((t & 7) == 7 && Clock::now() > deadline) { result = Outcome::Timeout; break; }
 		}
 
+		// A cube that was pressed on the ground must leave it. If the clone never did,
+		// the simulation is not running real physics, so "survived" means nothing.
+		// Report it as unknown (Special = let the player's own click through).
+		if (ground && pressEvent && result == Outcome::Survives && !left && total > delay + 16) {
+			g_simBroken = true;
+			result = Outcome::Special;
+		}
+
 		g_simEnd = g_clone->m_position;
 		g_simulating = false;
 		g_clone->releaseAllButtons();
@@ -393,6 +424,11 @@ namespace pib {
 		auto r0 = simulate(layer, real, 0, true, start + std::chrono::milliseconds(budgetMs()));
 		g_recordTrace = false;
 		double took = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+		if (debugOn() && (g_simBroken || (std::fabs(g_simEnd.x - g_simStart.x) < 1.f && std::fabs(g_simEnd.y - g_simStart.y) < 1.f))) {
+			say(fmt::format("PIB SIM FROZEN{} dx={:.1f} dy={:.1f} | {}",
+				g_simBroken ? " (clone never jumped)" : "",
+				g_simEnd.x - g_simStart.x, g_simEnd.y - g_simStart.y, g_diag), 8.0f);
+		}
 		if (r0 == Outcome::Dies && g_simTicks <= kDoomedTicks) {
 			if (debugOn()) say("PIB press: doomed within 2 ticks -> passing click through", 1.5f);
 			return false;
@@ -610,7 +646,7 @@ class $modify(PIBMenu, MenuLayer) {
 	bool init() {
 		if (!MenuLayer::init()) return false;
 		auto size = CCDirector::sharedDirector()->getWinSize();
-		auto* label = CCLabelBMFont::create("PIB v0.7.5 loaded", "bigFont.fnt");
+		auto* label = CCLabelBMFont::create("PIB v0.7.6 loaded", "bigFont.fnt");
 		label->setScale(0.4f);
 		label->setPosition({ size.width / 2.f, 12.f });
 		label->setZOrder(100);
