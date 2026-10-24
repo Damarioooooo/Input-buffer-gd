@@ -6,7 +6,7 @@
 	},
 	"id": "cesar.input-buffer",
 	"name": "Predictive Input Buffer",
-	"version": "v0.7.2",
+	"version": "v0.7.3",
 	"developer": "CesarGD96",
 	"description": "Two buffer modes. Predictive: if clicking now would kill you, your click is held back and the mod fires its own click at the first moment that survives. Classic: a click made in the air is remembered and fired when you land. Includes per-tick wave correction, orb assist and a noclip toggle.",
 	"settings": {
