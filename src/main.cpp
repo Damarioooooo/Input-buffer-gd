@@ -57,6 +57,12 @@ namespace pib {
 	inline int g_classicLeft = 0;        // ticks left in the buffer window
 	inline int g_classicReleaseIn = 0;   // ticks until we let go of a click we fired
 
+	// ---- predictive "hold and wait" state ----
+	inline bool g_pendingPress = false;     // a click is being held back, waiting for a safe moment
+	inline int64_t g_pendingSince = 0;      // g_updates when the click was made
+	inline bool g_pendingReleased = false;  // player let go while it was waiting
+	inline int64_t g_pendingHold = 0;       // how long the player held the click (ticks)
+
 	inline bool enabled() {
 		return Mod::get()->getSettingValue<bool>("enabled");
 	}
@@ -115,6 +121,9 @@ namespace pib {
 		g_classicPending = false;
 		g_classicLeft = 0;
 		g_classicReleaseIn = 0;
+		g_pendingPress = false;
+		g_pendingReleased = false;
+		g_pendingHold = 0;
 	}
 
 	inline void releaseClone() {
@@ -326,6 +335,68 @@ namespace pib {
 		}
 		return 0;
 	}
+	// Click just happened: would it kill us right now? If so, the click is held back.
+	inline bool shouldHold(GJBaseGameLayer* layer, PlayerObject* real) {
+		if (!ensureClone(layer)) {
+			if (debugOn()) say("PIB: could not create clone");
+			return false;
+		}
+		auto start = Clock::now();
+		auto r0 = simulate(layer, real, 0, true, start + std::chrono::milliseconds(budgetMs()));
+		double took = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+		if (r0 == Outcome::Dies) {
+			if (debugOn()) say(fmt::format("PIB press: would die -> holding click ({:.1f}ms)", took));
+			return true;
+		}
+		if (debugOn()) {
+			say(fmt::format("PIB press: now {} -> pass through ({:.1f}ms of {}ms)",
+				name(r0), took, budgetMs()));
+		}
+		return false;
+	}
+
+	// Runs once per physics tick while a click is being held back.
+	// Fires the click at the first tick where it no longer kills us.
+	inline void tickPending(PlayLayer* pl, PlayerObject* p) {
+		int64_t waited = g_updates - g_pendingSince;
+		bool fire = false;
+		std::string why;
+
+		if (waited >= maxDelayTicks()) {
+			fire = true;
+			why = "wait limit reached";
+		} else {
+			auto* layer = static_cast<GJBaseGameLayer*>(pl);
+			if (!ensureClone(layer)) {
+				fire = true;
+				why = "no clone";
+			} else {
+				auto start = Clock::now();
+				auto r = simulate(layer, p, 0, true, start + std::chrono::milliseconds(budgetMs()));
+				if (r == Outcome::Survives || r == Outcome::Special) {
+					fire = true;
+					why = fmt::format("safe ({})", name(r));
+				}
+				// Dies or Timeout: keep waiting
+			}
+		}
+
+		if (!fire) return;
+
+		g_pendingPress = false;
+		g_bypass = true;
+		pl->handleButton(true, 1, true);
+		g_bypass = false;
+
+		// If the player already let go, release after the same hold length.
+		if (g_pendingReleased) {
+			int64_t hold = std::max<int64_t>(1, g_pendingHold);
+			g_queue.push_back({g_updates + hold, false});
+		}
+		g_pendingReleased = false;
+
+		if (debugOn()) say(fmt::format("PIB: click delivered after {} ticks - {}", waited, why));
+	}
 }
 
 // Probe 1: proves this exact build is installed and loaded (label on the main menu).
@@ -333,7 +404,7 @@ class $modify(PIBMenu, MenuLayer) {
 	bool init() {
 		if (!MenuLayer::init()) return false;
 		auto size = CCDirector::sharedDirector()->getWinSize();
-		auto* label = CCLabelBMFont::create("PIB v0.6.0 loaded", "bigFont.fnt");
+		auto* label = CCLabelBMFont::create("PIB v0.6.1 loaded", "bigFont.fnt");
 		label->setScale(0.4f);
 		label->setPosition({ size.width / 2.f, 12.f });
 		label->setZOrder(100);
@@ -356,6 +427,7 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 		// ---- classic mode: click always goes through, and is also remembered ----
 		if (pib::classicMode()) {
 			pib::flush(pl); // in case the mode was switched mid-level
+			pib::g_pendingPress = false;
 			auto* p = pl->m_player1;
 			// Decide BEFORE the click is applied, otherwise a normal ground jump
 			// would look like an air click.
@@ -376,6 +448,7 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 				pib::say(fmt::format("PIB inactive: {}", why));
 			}
 			pib::flush(pl);
+			pib::g_pendingPress = false;
 			GJBaseGameLayer::handleButton(down, button, isPlayer1);
 			return;
 		}
@@ -384,11 +457,30 @@ class $modify(PIBGameLayer, GJBaseGameLayer) {
 		auto* player = pl->m_player1;
 		int64_t delay = 0;
 
+		// A click is already being held back: just remember what the player does with it.
+		if (pib::g_pendingPress) {
+			if (down) {
+				pib::g_pendingReleased = false;
+			} else {
+				pib::g_pendingReleased = true;
+				pib::g_pendingHold = std::max<int64_t>(1, pib::g_updates - pib::g_pendingSince);
+			}
+			return;
+		}
+
 		if (!pib::g_queue.empty()) {
 			delay = pib::g_shift;                       // something is waiting: keep the rhythm
 		} else if (down) {
-			delay = pib::chooseDelay(self, player, true);
-			pib::g_shift = delay;
+			pib::g_shift = 0;
+			if (pib::shouldHold(self, player)) {
+				// This click would kill us: swallow it and wait for a safe moment.
+				pib::g_pendingPress = true;
+				pib::g_pendingSince = pib::g_updates;
+				pib::g_pendingReleased = false;
+				pib::g_pendingHold = 0;
+				return;
+			}
+			delay = 0;
 		} else if (player->m_isDart && pib::waveRelease()) {
 			delay = pib::chooseDelay(self, player, false);
 			pib::g_shift = delay;
@@ -464,6 +556,9 @@ class $modify(PIBPlayer, PlayerObject) {
 			}
 
 			if (dt > 0.f) pib::g_dt = dt;
+
+			// a held-back click: fire it at the first safe tick
+			if (pib::g_pendingPress) pib::tickPending(pl, self);
 
 			// deliver delayed clicks at the start of their tick (predictive mode)
 			while (!pib::g_queue.empty() && pib::g_queue.front().fireAt <= pib::g_updates) {
