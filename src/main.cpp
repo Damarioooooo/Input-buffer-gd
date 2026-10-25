@@ -88,6 +88,10 @@ static int g_smartMargin = 0;      // extra safety around hazards, in units
 static bool g_smartEarliest = false;
 static int g_sjLat = 0;            // steps between our click and the icon lifting off
 static float g_vx = 0.f;           // measured horizontal units per step
+static int g_robotMinHold = 0;     // robot: shortest hold in ticks (0 = off)
+static bool g_smartWave = false;   // wave: retime a turn that would hit a hazard
+static int g_smartWaveWindow = 4;  // wave: ticks a turn may be delayed
+static float g_wvy = 0.f;          // measured wave vertical units per step
 static constexpr char const* INJECT_NAMES[] = {"Short", "Mirror my hold"};
 static constexpr char const* SMART_PICK_NAMES[] = {"Middle", "Earliest"};
 
@@ -131,6 +135,9 @@ static void loadSettings() {
     g_smartWindow = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("smart-window")), 1, 40);
     g_smartMargin = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("smart-margin")), 0, 6);
     g_smartEarliest = m->getSettingValue<std::string>("smart-pick") == "Earliest";
+    g_robotMinHold = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("robot-minhold")), 0, 32);
+    g_smartWave = m->getSettingValue<bool>("smart-wave");
+    g_smartWaveWindow = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("smart-wave-window")), 1, 16);
     refreshHud();
 }
 
@@ -415,6 +422,8 @@ static constexpr ProfileKey PROFILE_KEYS[] = {
     {"ship-style", 's'}, {"ufo-style", 's'}, {"swing-style", 's'},
     {"inject-hold", 's'}, {"rering", 'b'}, {"coyote-ticks", 'i'},
     {"smart-jump", 'b'}, {"smart-window", 'i'}, {"smart-margin", 'i'}, {"smart-pick", 's'},
+    {"robot-minhold", 'i'},
+    {"smart-wave", 'b'}, {"smart-wave-window", 'i'},
 };
 
 static std::string serializeProfile() {
@@ -1665,6 +1674,9 @@ $on_mod(Loaded) {
     listenForSettingChanges<std::string>("legit-mode", [](std::string) { loadSettings(); });
     listenForSettingChanges<bool>("feedback", [](bool) { loadSettings(); });
     listenForSettingChanges<bool>("smart-jump", [](bool) { loadSettings(); });
+    listenForSettingChanges<int64_t>("robot-minhold", [](int64_t) { loadSettings(); });
+    listenForSettingChanges<bool>("smart-wave", [](bool) { loadSettings(); });
+    listenForSettingChanges<int64_t>("smart-wave-window", [](int64_t) { loadSettings(); });
     listenForSettingChanges<int64_t>("smart-window", [](int64_t) { loadSettings(); });
     listenForSettingChanges<int64_t>("smart-margin", [](int64_t) { loadSettings(); });
     listenForSettingChanges<std::string>("smart-pick", [](std::string) { loadSettings(); });
@@ -1680,7 +1692,7 @@ $on_mod(Loaded) {
         listenForSettingChanges<std::string>(key, [](std::string) { loadSettings(); });
     }
 
-    log::info("[InputBuffer] BufferMod loaded (v24: smart jump + panel). Main: {}, TPS: {}, wave: {}, dual: {}",
+    log::info("[InputBuffer] BufferMod loaded (v27: smart wave). Main: {}, TPS: {}, wave: {}, dual: {}",
               STAGE_NAMES[g_stage], g_tps, waveModeName(), g_dualEnabled ? "ON" : "OFF");
 }
 
@@ -1697,9 +1709,10 @@ struct Hz { float minx, maxx, miny, maxy; bool circle; float cx, cy, r; };
 static std::vector<Hz> g_haz;      // hazards of the current level, sorted by minx
 static bool g_hazBuilt = false;
 static std::map<std::string, std::vector<float>> g_tmpl; // jump shapes by icon size / gravity / TPS
+static std::map<std::string, int> g_tmplHold;            // robot: how long the learned jump was held (steps)
 
 static std::string smartKey(PlayerObject* p) {
-    std::string k = "sj-" + std::to_string(static_cast<int>(std::lround(p->getScale() * 100.f)));
+    std::string k = std::string(modeIndex(p) == 2 ? "sjr-" : "sj-") + std::to_string(static_cast<int>(std::lround(p->getScale() * 100.f)));
     k += p->m_isUpsideDown ? "-u-" : "-d-";
     k += std::to_string(g_tps);
     return k;
@@ -1719,7 +1732,7 @@ static std::vector<float> const* smartTemplate(std::string const& key) {
     return &g_tmpl[key];
 }
 
-static void smartStore(std::string const& key, std::vector<float> v) {
+static void smartStore(std::string const& key, std::vector<float> v, int hold = 0) {
     std::string raw;
     char buf[32];
     for (float f : v) {
@@ -1728,6 +1741,25 @@ static void smartStore(std::string const& key, std::vector<float> v) {
     }
     Mod::get()->setSavedValue<std::string>("tmpl-" + key, raw);
     g_tmpl[key] = std::move(v);
+    if (hold > 0) {
+        g_tmplHold[key] = hold;
+        Mod::get()->setSavedValue<std::string>("hold-" + key, std::to_string(hold));
+    }
+}
+
+// How long the learned robot jump was held, in steps (0 if unknown).
+static int smartHold(std::string const& key) {
+    auto it = g_tmplHold.find(key);
+    if (it != g_tmplHold.end()) return it->second;
+    int h = std::atoi(Mod::get()->getSavedValue<std::string>("hold-" + key, "").c_str());
+    if (h > 0) g_tmplHold[key] = h;
+    return h;
+}
+
+// Tells the player why a jump could not be learned (only until it is calibrated).
+static void smartNote(PlayerObject* p, char const* msg) {
+    if (smartTemplate(smartKey(p))) return;
+    Notification::create(msg, NotificationIcon::Warning, 2.0f)->show();
 }
 
 // ---- tabbed settings panel -----------------------------------------------
@@ -1743,6 +1775,7 @@ static constexpr PRow ROWS_BUFFER[] = {
     {"Ball window", "ball-ticks", 'i', -1, 64, nullptr, 0},
     {"Robot window", "robot-ticks", 'i', -1, 64, nullptr, 0},
     {"Spider window", "spider-ticks", 'i', -1, 64, nullptr, 0},
+    {"Robot min hold", "robot-minhold", 'i', 0, 32, nullptr, 0},
 };
 static constexpr PRow ROWS_FLY[] = {
     {"Ship window", "ship-ticks", 'i', -1, 64, nullptr, 0},
@@ -1759,6 +1792,8 @@ static constexpr PRow ROWS_SMART[] = {
     {"Look-ahead (ticks)", "smart-window", 'n', 1, 40, nullptr, 0},
     {"Safety margin", "smart-margin", 'n', 0, 6, nullptr, 0},
     {"Pick timing", "smart-pick", 'c', 0, 0, SMART_PICK_NAMES, 2},
+    {"Smart Wave", "smart-wave", 'b', 0, 0, nullptr, 0},
+    {"Wave look-ahead", "smart-wave-window", 'n', 1, 16, nullptr, 0},
 };
 static constexpr PRow ROWS_EXTRAS[] = {
     {"Buffer on/off", "enabled", 'b', 0, 0, nullptr, 0},
@@ -1776,7 +1811,7 @@ static constexpr PRow ROWS_TOOLS[] = {
     {"Debug logging", "debug", 'b', 0, 0, nullptr, 0},
 };
 static constexpr char const* EXTRA_DEFAULTS =
-    "inject-hold=Short|rering=0|coyote-ticks=0|smart-jump=0|smart-window=12|smart-margin=0|smart-pick=Middle";
+    "inject-hold=Short|rering=0|coyote-ticks=0|smart-jump=0|smart-window=12|smart-margin=0|smart-pick=Middle|robot-minhold=0|smart-wave=0|smart-wave-window=4";
 
 // Shows how early your buffered clicks were and suggests a window for each mode.
 class StatsPopup : public geode::Popup {
@@ -1939,7 +1974,7 @@ protected:
         }
 
         if (m_tab == 2) {
-            std::string st = "Learns your jump from your own jumps. Cube only.";
+            std::string st = "Learns jumps from your own jumps (cube, robot). Wave needs no setup.";
             if (auto pl = PlayLayer::get(); pl && pl->m_player1) {
                 st = smartTemplate(smartKey(pl->m_player1))
                     ? "Calibrated for this icon size and gravity."
@@ -2202,6 +2237,18 @@ struct PState {
     bool smartFire = false;      // a delayed click is on its way
     int smartFireAt = 0;
     int sjFireStep = -1;         // when we last fired, to measure liftoff latency
+    int smartHold = 0;           // robot: how long the fired click is held (steps)
+
+    // Smart Wave
+    bool wHave = false;
+    int wLastStep = -1;
+    float wLastX = 0.f, wLastY = 0.f;
+    bool swQueued = false;       // the queue holds retimed inputs of ours
+
+    // Robot minimum hold: a quick release is held back so the jump is not cut short.
+    bool robotRelease = false;
+    int robotReleaseAt = 0;
+    bool pressOnGround = false;
 };
 
 class $modify(BufferLayer, GJBaseGameLayer) {
@@ -2244,6 +2291,10 @@ class $modify(BufferLayer, GJBaseGameLayer) {
                 s.releaseNext = false;
                 if (!s.held) sendInput(p, false);
             }
+            if (s.robotRelease) {
+                s.robotRelease = false;
+                sendInput(p, false);
+            }
             s.pending = false;
         }
     }
@@ -2256,7 +2307,7 @@ class $modify(BufferLayer, GJBaseGameLayer) {
 
         bool inconsistent = false;
         for (auto& s : f->ps) {
-            if (s.delayedRelease || s.releaseNext || !s.waveQueue.empty()) {
+            if (s.delayedRelease || s.releaseNext || s.robotRelease || !s.waveQueue.empty()) {
                 inconsistent = true;
             }
             s = PState();
@@ -2294,15 +2345,20 @@ class $modify(BufferLayer, GJBaseGameLayer) {
     // Watches the cube to measure its speed and to learn the shape of a real
     // jump (height per step) from the player's own jumps.
     void smartObserve(PlayerObject* p, PState& s, int step) {
-        if (!g_smart || modeIndex(p) != 0 || sharedDualInput()) {
+        int mi = modeIndex(p);
+        if (!g_smart || (mi != 0 && mi != 2) || sharedDualInput()) {
             s.haveLast = false;
             s.jrec = false;
             return;
         }
+        bool robot = mi == 2; // robot height depends on the hold, so its jump shape is not a plain arc
         auto pos = p->getPosition();
         float x = pos.x, y = pos.y;
         bool ground = p->m_isOnGround;
         float sgn = p->m_isUpsideDown ? -1.f : 1.f;
+        // A click is queued with a timestamp and can be applied a few steps
+        // after it arrived, so the jump may show up several steps later.
+        int pressWin = std::max(12, static_cast<int>(std::lround(16 * stepsPerTick())));
 
         if (s.haveLast && step == s.lastStep + 1) {
             float dx = x - s.lastX;
@@ -2313,25 +2369,35 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             bool bad = sgn != s.jsgn || ringsTouching(p) > 0 || s.jT.size() > 600;
             if (bad) {
                 s.jrec = false;
+                smartNote(p, "Smart Jump: jump touched a ring or gravity changed. Try again.");
             } else if (ground) {
                 if (s.jT.size() >= 8 && std::fabs((y - s.jy0) * sgn) < 1.5f) {
-                    smartStore(smartKey(p), s.jT);
+                    bool had = smartTemplate(smartKey(p)) != nullptr;
+                    int hold = 0;
+                    if (robot) hold = s.held ? std::max(1, step - s.realPressStep) : s.lastHoldSteps;
+                    smartStore(smartKey(p), s.jT, hold);
                     log::info("[InputBuffer] smart jump: learned a jump of {} steps ({})", s.jT.size(), smartKey(p));
+                    if (!had) Notification::create("Smart Jump: learned your jump", NotificationIcon::Success, 2.0f)->show();
+                } else {
+                    smartNote(p, "Smart Jump: jump was too short or landed at another height. Try on flat ground.");
                 }
                 s.jrec = false;
             } else {
                 float dy = (y - s.jy0) * sgn;
                 size_t n = s.jT.size();
-                if (n >= 3) {
+                if (!robot && n >= 3) {
                     float d2 = dy - 2.f * s.jT[n - 1] + s.jT[n - 2];
                     if (n == 3) s.jd2 = d2;
-                    else if (std::fabs(d2 - s.jd2) > std::max(0.0005f, 0.5f * std::fabs(s.jd2))) s.jrec = false;
+                    else if (std::fabs(d2 - s.jd2) > std::max(0.0005f, 0.5f * std::fabs(s.jd2))) {
+                        s.jrec = false;
+                        smartNote(p, "Smart Jump: jump shape was not smooth. Try again on flat ground.");
+                    }
                 }
                 if (s.jrec) s.jT.push_back(dy);
             }
         } else if (s.haveLast && s.wasGround && !ground && step == s.lastStep + 1 &&
-                   (y - s.lastY) * sgn > 0.2f &&
-                   (step - s.realPressStep <= 4 || s.sjFireStep >= 0)) {
+                   (y - s.lastY) * sgn > (robot ? 0.05f : 0.2f) &&
+                   (step - s.realPressStep <= pressWin || s.sjFireStep >= 0)) {
             s.jrec = true;
             s.jy0 = s.lastY;
             s.jsgn = sgn;
@@ -2342,6 +2408,9 @@ class $modify(BufferLayer, GJBaseGameLayer) {
                 g_sjLat = std::clamp(step - 1 - s.sjFireStep, 0, 3);
                 s.sjFireStep = -1;
             }
+        } else if (!s.jrec && s.haveLast && s.wasGround && !ground && step == s.lastStep + 1 &&
+                   (y - s.lastY) * sgn > 0.2f) {
+            smartNote(p, "Smart Jump: that jump did not come from your click (pad or orb?).");
         }
 
         s.wasGround = ground;
@@ -2386,14 +2455,21 @@ class $modify(BufferLayer, GJBaseGameLayer) {
 
     // Returns how many steps to wait before firing the click, or -1 to let the
     // click go through untouched.
-    int smartDecide(PlayerObject* p, PState& s, int step) {
-        if (!g_smart || modeIndex(p) != 0 || !p->m_isOnGround || sharedDualInput()) return -1;
+    int smartDecide(PlayerObject* p, PState& s, int step, int& holdOut) {
+        holdOut = 0;
+        int mi = modeIndex(p);
+        if (!g_smart || (mi != 0 && mi != 2) || !p->m_isOnGround || sharedDualInput()) return -1;
         if (g_vx <= 0.05f) return -1;
         std::string key = smartKey(p);
         auto tm = smartTemplate(key);
         if (!tm) {
             DBG("[InputBuffer] smart jump: not calibrated for {} (jump once first)", key);
             return -1;
+        }
+        if (mi == 2) {
+            // Robot: the fired click is held as long as the learned jump was held.
+            holdOut = smartHold(key);
+            if (holdOut <= 0) return -1;
         }
         ensureHazards();
         if (g_haz.empty()) return -1;
@@ -2429,8 +2505,8 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             for (int m = 1; m <= last; m++) {
                 float cx = x0 + vx * m + offx;
                 float dy = 0.f;
-                if (m > O) {
-                    int k = m - O;
+                if (m >= O) {
+                    int k = m - O + 1;
                     if (k <= N) dy = (*tm)[k - 1];
                 }
                 float cy = y0 + sgn * dy + offy;
@@ -2468,12 +2544,98 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         return pick;
     }
 
+    // Measures the wave's real speed (horizontal and vertical units per step).
+    void smartObserveWave(PlayerObject* p, PState& s, int step) {
+        auto pos = p->getPosition();
+        if (s.wHave && step == s.wLastStep + 1) {
+            float dx = pos.x - s.wLastX, dy = pos.y - s.wLastY;
+            if (dx > 0.01f) g_vx = dx;
+            if (std::fabs(dy) > 0.2f) g_wvy = std::fabs(dy);
+        }
+        s.wLastX = pos.x;
+        s.wLastY = pos.y;
+        s.wLastStep = step;
+        s.wHave = true;
+    }
+
+    // Wave: if turning now would fly into a hazard but turning a few steps
+    // later would not, returns how many steps to wait; otherwise -1. It assumes
+    // the wave keeps its new direction for a short while after the turn.
+    int smartWaveDecide(PlayerObject* p, PState& s, int step, bool down) {
+        if (!g_smartWave || sharedDualInput() || s.held == down) return -1;
+        if (g_vx <= 0.05f || g_wvy <= 0.05f) return -1;
+        ensureHazards();
+        if (g_haz.empty()) return -1;
+
+        auto pos = p->getPosition();
+        float x0 = pos.x, y0 = pos.y;
+        CCRect pr = p->getObjectRect();
+        float pw = pr.size.width, ph = pr.size.height;
+        float offx = pr.getMidX() - pos.x, offy = pr.getMidY() - pos.y;
+        if (pw < 1.f || ph < 1.f) {
+            pw = ph = 10.f * p->getScale();
+            offx = offy = 0.f;
+        }
+        float sgn = p->m_isUpsideDown ? -1.f : 1.f;
+        int W = std::max(1, static_cast<int>(std::lround(g_smartWaveWindow * stepsPerTick())));
+        int H = std::max(8, static_cast<int>(std::lround(16 * stepsPerTick())));
+        float margin = static_cast<float>(g_smartMargin);
+        float vx = g_vx, vy = g_wvy;
+        bool wasHeld = s.held;
+
+        float xmax = x0 + vx * (1 + W + H) + pw + 40.f;
+        std::vector<Hz const*> nearby;
+        auto it = std::lower_bound(g_haz.begin(), g_haz.end(), x0 - 300.f,
+                                   [](Hz const& h, float v) { return h.minx < v; });
+        for (; it != g_haz.end() && it->minx <= xmax; ++it) nearby.push_back(&*it);
+        if (nearby.empty()) return -1;
+
+        auto survives = [&](int d) {
+            float y = y0;
+            int last = 1 + d + H;
+            for (int m = 1; m <= last; m++) {
+                bool heldNow = (m <= d) ? wasHeld : down;
+                y += (heldNow ? 1.f : -1.f) * sgn * vy;
+                float cx = x0 + vx * m + offx, cy = y + offy;
+                float l = cx - pw * 0.5f, r = cx + pw * 0.5f;
+                float b = cy - ph * 0.5f, t = cy + ph * 0.5f;
+                for (auto h : nearby) {
+                    if (r < h->minx - margin || l > h->maxx + margin) continue;
+                    if (h->circle) {
+                        float qx = std::clamp(h->cx, l, r), qy = std::clamp(h->cy, b, t);
+                        float ddx = qx - h->cx, ddy = qy - h->cy;
+                        float rr = h->r + margin;
+                        if (ddx * ddx + ddy * ddy < rr * rr) return false;
+                    } else if (b < h->maxy + margin && t > h->miny - margin) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
+        if (survives(0)) return -1;
+        int a = -1;
+        for (int d = 1; d <= W; d++) {
+            if (survives(d)) { a = d; break; }
+        }
+        if (a < 0) return -1;
+        int b = a;
+        while (b + 1 <= W && survives(b + 1)) b++;
+        int pick = g_smartEarliest ? a : a + (b - a) / 2;
+        DBG("[InputBuffer] smart wave: delaying {} {} steps (safe {}..{}, window {})",
+            down ? "press" : "release", pick, a, b, W);
+        return pick;
+    }
+
     void stepPlayer(PlayerObject* p, PState& s, int idx) {
         int step = m_fields->step;
         char const* tag = idx == 0 ? "P1" : "P2";
 
         if (isGroundMode(p) && p->m_isOnGround) s.lastGroundStep = step;
         if (idx == 0) smartObserve(p, s, step);
+        if (idx == 0 && g_smartWave && modeIndex(p) == MODE_WAVE) smartObserveWave(p, s, step);
+        else s.wHave = false;
 
         // Smart Jump: the held-back click goes out at the chosen tick.
         if (s.smartFire && step >= s.smartFireAt) {
@@ -2481,11 +2643,18 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             if (isGroundMode(p) && p->m_isOnGround) {
                 sendInput(p, true);
                 s.releaseNext = true;
-                s.releaseNextAt = step + injectHoldSteps(s);
+                s.releaseNextAt = step + (s.smartHold > 0 ? s.smartHold : injectHoldSteps(s));
                 s.sjFireStep = step;
                 DBG("[InputBuffer] {} SMART JUMP click at step {}", tag, step);
                 showText("SMART");
             }
+        }
+
+        // Robot minimum hold: the held-back release goes out now.
+        if (s.robotRelease && (step >= s.robotReleaseAt || modeIndex(p) != 2)) {
+            s.robotRelease = false;
+            sendInput(p, false);
+            DBG("[InputBuffer] {} ROBOT release applied at step {}", tag, step);
         }
 
         // A click that came a few ticks after leaving the ground is injected
@@ -2592,11 +2761,55 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         char const* tag = idx == 0 ? "P1" : "P2";
 
         // Remember how long the player really holds, for Mirror hold.
-        if (down) s.realPressStep = step;
-        else if (s.realPressStep >= 0) s.lastHoldSteps = std::max(1, step - s.realPressStep);
+        if (down) {
+            s.realPressStep = step;
+            s.pressOnGround = p->m_isOnGround;
+            // A release is still being held back: let go first so the new
+            // press arrives as a fresh click, in the right order.
+            if (s.robotRelease) {
+                s.robotRelease = false;
+                sendInput(p, false);
+            }
+        } else if (s.realPressStep >= 0) {
+            s.lastHoldSteps = std::max(1, step - s.realPressStep);
+            // Robot minimum hold: a very quick tap on the ground is held for at
+            // least the set time, so the jump height stays consistent.
+            if (g_robotMinHold > 0 && modeIndex(p) == 2 && s.pressOnGround && !s.robotRelease) {
+                int need = std::max(1, static_cast<int>(std::lround(g_robotMinHold * stepsPerTick())));
+                if (step - s.realPressStep < need) {
+                    s.robotRelease = true;
+                    s.robotReleaseAt = s.realPressStep + need;
+                    s.held = false;
+                    DBG("[InputBuffer] {} ROBOT release held back until step {}", tag, s.robotReleaseAt);
+                    return true;
+                }
+            }
+        }
 
         if (!isFlyMode(p) && !s.waveQueue.empty()) {
             flushWaveQueue(p, s, idx);
+        }
+
+        // Smart Wave: retime a turn that would hit a hazard. Later inputs queue
+        // behind a retimed one so the order is kept.
+        if (g_smartWave && idx == 0 && modeIndex(p) == MODE_WAVE && step >= m_fields->graceUntil) {
+            if (!s.waveQueue.empty()) {
+                if (s.swQueued) {
+                    int target = std::max(step + 1, s.waveQueue.back().second + 1);
+                    s.held = down;
+                    s.waveQueue.emplace_back(down, target);
+                    return true;
+                }
+            } else {
+                s.swQueued = false;
+                int d = smartWaveDecide(p, s, step, down);
+                if (d > 0) {
+                    s.held = down;
+                    s.swQueued = true;
+                    s.waveQueue.emplace_back(down, step + 1 + d);
+                    return true;
+                }
+            }
         }
 
         int n = modeLimitSteps(p);
@@ -2665,8 +2878,10 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         // slightly later start clears it, hold the click back and fire it then.
         if (down && g_smart && idx == 0) {
             if (s.smartFire) return true; // one is already on its way
-            int d = smartDecide(p, s, step);
+            int hold = 0;
+            int d = smartDecide(p, s, step, hold);
             if (d > 0) {
+                s.smartHold = hold;
                 s.held = true;
                 s.pending = false;
                 s.smartFire = true;
