@@ -92,8 +92,6 @@ static constexpr char const* INJECT_NAMES[] = {"Short", "Mirror my hold"};
 static bool g_predict = false;
 static int g_predictDelay = 2;     // largest delay tested, in game updates
 static void pbFlushNow();          // sends any queued predictive click right away
-static constexpr char const* INJECT_NAMES[] = {"Short", "Mirror my hold"};
-static constexpr char const* SMART_PICK_NAMES[] = {"Middle", "Earliest"};
 
 // Hotkeys are keybind settings. Order: 0 stage, 1 tps up, 2 tps down, 3 debug, 4 wave mode, 5 add section.
 static constexpr int KEYBIND_COUNT = 6;
