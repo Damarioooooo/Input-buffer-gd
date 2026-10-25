@@ -5,7 +5,7 @@
     },
     "id": "lyophi.buffermod",
     "name": "Input Buffer",
-    "version": "v1.2.0",
+    "version": "v1.3.0",
     "developer": "Lyophi",
     "description": "Predictive input buffering for Geometry Dash. Early clicks are remembered and fired when you land or touch an orb, and ship, UFO, swing and wave get smoother, more consistent timing.",
     "settings": {
@@ -253,6 +253,42 @@
             "name": "Click Feedback",
             "description": "Shows a small +N.Nt at the top of the screen each time the mod fires a buffered click, with how many ticks early you were.",
             "default": true
+        },
+        "sec-smart": {
+            "type": "title",
+            "name": "Smart Jump (cube)",
+            "description": "Looks at the spikes and saws ahead. If your ground click would hit one but a slightly later jump would clear it, the click is held back and fired at the safe tick. It learns your jump from your own jumps, so jump once on flat ground first. Spikes and saws only: solid blocks, orbs and pads are not predicted."
+        },
+        "smart-jump": {
+            "type": "bool",
+            "name": "Smart Jump (Experimental)",
+            "description": "Turns Smart Jump on. Cube only. Off by default.",
+            "default": false
+        },
+        "smart-window": {
+            "type": "int",
+            "name": "Smart Look-ahead (ticks)",
+            "description": "How many ticks later than your click the mod may start the jump.",
+            "default": 12,
+            "min": 1,
+            "max": 40,
+            "control": { "input": true, "arrows": true, "slider": false }
+        },
+        "smart-margin": {
+            "type": "int",
+            "name": "Smart Safety Margin",
+            "description": "Extra space kept around hazards, in game units. 0 trusts the hitboxes exactly. Raise it if you still clip spikes, but a big margin can leave no safe timing.",
+            "default": 0,
+            "min": 0,
+            "max": 6,
+            "control": { "input": true, "arrows": true, "slider": false }
+        },
+        "smart-pick": {
+            "type": "string",
+            "name": "Smart Timing Pick",
+            "description": "**Middle**: the middle of the safe timings, the most forgiving.\n**Earliest**: the first safe tick.",
+            "default": "Middle",
+            "one-of": ["Middle", "Earliest"]
         },
         "sec-general": {
             "type": "title",
