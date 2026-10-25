@@ -1,8 +1,13 @@
 #include <Geode/Geode.hpp>
+#include <Geode/modify/EffectGameObject.hpp>
+#include <Geode/modify/GameObject.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/modify/HardStreak.hpp>
+#include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -80,18 +85,13 @@ static bool g_feedback = true;
 static constexpr int INJECT_CAP_TICKS = 30;
 static void refreshHud();
 
-// Smart Jump (cube): learns a real jump, then delays an early ground click to
-// a start tick that clears the hazards ahead.
-static bool g_smart = false;
-static int g_smartWindow = 12;     // ticks to look ahead
-static int g_smartMargin = 0;      // extra safety around hazards, in units
-static bool g_smartEarliest = false;
-static int g_sjLat = 0;            // steps between our click and the icon lifting off
-static float g_vx = 0.f;           // measured horizontal units per step
 static int g_robotMinHold = 0;     // robot: shortest hold in ticks (0 = off)
-static bool g_smartWave = false;   // wave: retime a turn that would hit a hazard
-static int g_smartWaveWindow = 4;  // wave: ticks a turn may be delayed
-static float g_wvy = 0.f;          // measured wave vertical units per step
+static constexpr char const* INJECT_NAMES[] = {"Short", "Mirror my hold"};
+
+// Predictive buffer: tests delays on a hidden copy of the player.
+static bool g_predict = false;
+static int g_predictDelay = 2;     // largest delay tested, in game updates
+static void pbFlushNow();          // sends any queued predictive click right away
 static constexpr char const* INJECT_NAMES[] = {"Short", "Mirror my hold"};
 static constexpr char const* SMART_PICK_NAMES[] = {"Middle", "Earliest"};
 
@@ -131,13 +131,9 @@ static void loadSettings() {
     g_hud = m->getSettingValue<bool>("hud");
     g_hudPos = indexOf(HUD_POS_NAMES, 4, m->getSettingValue<std::string>("hud-pos"), 1);
     g_feedback = m->getSettingValue<bool>("feedback");
-    g_smart = m->getSettingValue<bool>("smart-jump");
-    g_smartWindow = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("smart-window")), 1, 40);
-    g_smartMargin = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("smart-margin")), 0, 6);
-    g_smartEarliest = m->getSettingValue<std::string>("smart-pick") == "Earliest";
     g_robotMinHold = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("robot-minhold")), 0, 32);
-    g_smartWave = m->getSettingValue<bool>("smart-wave");
-    g_smartWaveWindow = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("smart-wave-window")), 1, 16);
+    g_predict = m->getSettingValue<bool>("predictive");
+    g_predictDelay = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("predictive-delay")), 1, 16);
     refreshHud();
 }
 
@@ -421,9 +417,8 @@ static constexpr ProfileKey PROFILE_KEYS[] = {
     {"dual-mode", 'b'},
     {"ship-style", 's'}, {"ufo-style", 's'}, {"swing-style", 's'},
     {"inject-hold", 's'}, {"rering", 'b'}, {"coyote-ticks", 'i'},
-    {"smart-jump", 'b'}, {"smart-window", 'i'}, {"smart-margin", 'i'}, {"smart-pick", 's'},
     {"robot-minhold", 'i'},
-    {"smart-wave", 'b'}, {"smart-wave-window", 'i'},
+    {"predictive", 'b'}, {"predictive-delay", 'i'},
 };
 
 static std::string serializeProfile() {
@@ -1673,13 +1668,12 @@ $on_mod(Loaded) {
     listenForSettingChanges<int64_t>("coyote-ticks", [](int64_t) { loadSettings(); });
     listenForSettingChanges<std::string>("legit-mode", [](std::string) { loadSettings(); });
     listenForSettingChanges<bool>("feedback", [](bool) { loadSettings(); });
-    listenForSettingChanges<bool>("smart-jump", [](bool) { loadSettings(); });
     listenForSettingChanges<int64_t>("robot-minhold", [](int64_t) { loadSettings(); });
-    listenForSettingChanges<bool>("smart-wave", [](bool) { loadSettings(); });
-    listenForSettingChanges<int64_t>("smart-wave-window", [](int64_t) { loadSettings(); });
-    listenForSettingChanges<int64_t>("smart-window", [](int64_t) { loadSettings(); });
-    listenForSettingChanges<int64_t>("smart-margin", [](int64_t) { loadSettings(); });
-    listenForSettingChanges<std::string>("smart-pick", [](std::string) { loadSettings(); });
+    listenForSettingChanges<bool>("predictive", [](bool) {
+        loadSettings();
+        if (!g_predict) pbFlushNow();
+    });
+    listenForSettingChanges<int64_t>("predictive-delay", [](int64_t) { loadSettings(); });
     listenForSettingChanges<bool>("hud", [](bool) {
         loadSettings();
         if (auto pl = PlayLayer::get()) buildHud(pl);
@@ -1692,7 +1686,7 @@ $on_mod(Loaded) {
         listenForSettingChanges<std::string>(key, [](std::string) { loadSettings(); });
     }
 
-    log::info("[InputBuffer] BufferMod loaded (v27: smart wave). Main: {}, TPS: {}, wave: {}, dual: {}",
+    log::info("[InputBuffer] BufferMod loaded (v29: predictive buffer). Main: {}, TPS: {}, wave: {}, dual: {}",
               STAGE_NAMES[g_stage], g_tps, waveModeName(), g_dualEnabled ? "ON" : "OFF");
 }
 
@@ -1704,62 +1698,284 @@ $on_game(Loaded) {
     }
 }
 
-// ---- Smart Jump data -----------------------------------------------------
-struct Hz { float minx, maxx, miny, maxy; bool circle; float cx, cy, r; };
-static std::vector<Hz> g_haz;      // hazards of the current level, sorted by minx
-static bool g_hazBuilt = false;
-static std::map<std::string, std::vector<float>> g_tmpl; // jump shapes by icon size / gravity / TPS
-static std::map<std::string, int> g_tmplHold;            // robot: how long the learned jump was held (steps)
+// ---- Predictive buffer -----------------------------------------------------
+// On a hidden copy of the player, the game's own collision code is run for the
+// next updates. If the click as it is would die but waiting 1..N updates would
+// not, the real click is queued for the earliest safe update. If no delay in the
+// window is safe, the click goes through right away.
+namespace pb {
+    constexpr int kJumpButton = 1;
+    constexpr float kFallbackDelta = 1.f / 240.f;
+    constexpr int kCubeHorizon = 48;
+    constexpr int kWaveHorizon = 38;
+    constexpr int kMiniWaveHorizon = 28;
 
-static std::string smartKey(PlayerObject* p) {
-    std::string k = std::string(modeIndex(p) == 2 ? "sjr-" : "sj-") + std::to_string(static_cast<int>(std::lround(p->getScale() * 100.f)));
-    k += p->m_isUpsideDown ? "-u-" : "-d-";
-    k += std::to_string(g_tps);
-    return k;
-}
+    struct PendingInput {
+        bool active = false;
+        int ticksRemaining = 0;
+        bool state = false;
+        bool oppositeQueued = false;
+        bool isPlayer1 = true;
+        int button = kJumpButton;
+    };
 
-static std::vector<float> const* smartTemplate(std::string const& key) {
-    auto it = g_tmpl.find(key);
-    if (it != g_tmpl.end()) return &it->second;
-    std::string raw = Mod::get()->getSavedValue<std::string>("tmpl-" + key, "");
-    if (raw.empty()) return nullptr;
-    std::vector<float> v;
-    for (auto const& part : splitStr(raw, ',')) {
-        if (!part.empty()) v.push_back(static_cast<float>(std::atof(part.c_str())));
+    struct SimulationResult {
+        int survived = 0;
+        bool diedBeforeInput = false;
+        bool supported = true;
+    };
+
+    std::array<PendingInput, 2> g_pending{};
+    PlayerObject* g_ghost = nullptr;
+    bool g_simulating = false;
+    bool g_ghostDied = false;
+    bool g_injecting = false;
+    float g_frameDelta = kFallbackDelta;
+
+    bool isEnabled() {
+        return g_predict && assistAllowed();
     }
-    if (v.size() < 8) return nullptr;
-    g_tmpl[key] = std::move(v);
-    return &g_tmpl[key];
-}
 
-static void smartStore(std::string const& key, std::vector<float> v, int hold = 0) {
-    std::string raw;
-    char buf[32];
-    for (float f : v) {
-        std::snprintf(buf, sizeof buf, "%.4f,", f);
-        raw += buf;
+    int getMaxDelay() {
+        return std::clamp(g_predictDelay, 1, 16);
     }
-    Mod::get()->setSavedValue<std::string>("tmpl-" + key, raw);
-    g_tmpl[key] = std::move(v);
-    if (hold > 0) {
-        g_tmplHold[key] = hold;
-        Mod::get()->setSavedValue<std::string>("hold-" + key, std::to_string(hold));
+
+    bool isSupportedPlayer(PlayerObject* player, PlayLayer* layer, bool isPlayer1) {
+        return player
+            && layer
+            && isPlayer1
+            && !layer->m_gameState.m_isDualMode
+            && !player->m_isDead
+            && !player->m_isShip
+            && !player->m_isPlatformer
+            && !player->m_isDashing;
+    }
+
+    bool isFlying(PlayerObject* player) {
+        return player && (player->m_isDart || player->m_isBird || player->m_isSwing);
+    }
+
+    bool isCollisionRelevant(GameObject* object) {
+        if (!object || object->m_isDisabled || object->m_isDisabled2) return false;
+        auto type = static_cast<unsigned>(object->m_objectType);
+        return type == static_cast<unsigned>(GameObjectType::Solid)
+            || type == static_cast<unsigned>(GameObjectType::Hazard)
+            || type == static_cast<unsigned>(GameObjectType::Slope)
+            || type == static_cast<unsigned>(GameObjectType::CollisionObject)
+            || type == static_cast<unsigned>(GameObjectType::AnimatedHazard);
+    }
+
+    PendingInput* pendingFor(bool isPlayer1) {
+        return &g_pending[isPlayer1 ? 0u : 1u];
+    }
+
+    void resetPending() {
+        for (auto& input : g_pending) input = PendingInput{};
+    }
+
+    void setGhostButton(PlayerObject* ghost, bool down) {
+        if (down) ghost->pushButton(PlayerButton::Jump);
+        else ghost->releaseButton(PlayerButton::Jump);
+    }
+
+    void copyPlayerState(PlayerObject* ghost, PlayerObject* real) {
+        ghost->copyAttributes(real);
+        ghost->setPosition(real->getPosition());
+        ghost->setScale(real->getScale());
+        ghost->setContentSize(real->getContentSize());
+        ghost->m_width = real->m_width;
+        ghost->m_height = real->m_height;
+        ghost->m_gravityMod = real->m_gravityMod;
+        ghost->m_isOnGround = real->m_isOnGround;
+        ghost->m_isUpsideDown = real->m_isUpsideDown;
+        ghost->m_vehicleSize = real->m_vehicleSize;
+        ghost->m_playerSpeed = real->m_playerSpeed;
+        ghost->m_isDead = false;
+        ghost->setVisible(false);
+        ghost->m_playEffects = false;
+        ghost->m_hasGroundParticles = false;
+        ghost->m_hasShipParticles = false;
+        ghost->removeAllParticles();
+        ghost->releaseAllButtons();
+        ghost->resetCollisionLog(true);
+    }
+
+    void advanceGhost(PlayerObject* ghost, float dt) {
+        ghost->update(dt);
+        ghost->updateRotation(dt);
+    }
+
+    void checkGhost(PlayLayer* layer, PlayerObject* ghost, float dt) {
+        ghost->resetCollisionLog(true);
+        layer->checkCollisions(ghost, dt, false);
+    }
+
+    // Returns how many simulation updates the player survives after the
+    // requested transition. For delay > 0, the opposite button state is held
+    // until the exact candidate frame, then the requested state remains held.
+    SimulationResult simulate(PlayLayer* layer, PlayerObject* real, bool down, int delay, int horizon) {
+        SimulationResult result;
+        if (!layer || !real || !g_ghost || g_ghost == real) {
+            result.supported = false;
+            return result;
+        }
+
+        float dt = g_frameDelta;
+        if (!std::isfinite(dt) || dt <= 0.f || dt > 0.05f) dt = kFallbackDelta;
+
+        copyPlayerState(g_ghost, real);
+        g_ghostDied = false;
+        g_simulating = true;
+
+        if (delay > 0) {
+            setGhostButton(g_ghost, !down);
+        }
+        else {
+            // The zero-delay baseline must include the requested input, or it
+            // only simulates the current trajectory and the search never runs.
+            setGhostButton(g_ghost, down);
+        }
+
+        const int total = delay + horizon;
+        int airTicks = 0;
+        int groundTicks = 0;
+        bool flying = isFlying(real);
+
+        for (int tick = 0; tick < total; ++tick) {
+            if (tick == delay) setGhostButton(g_ghost, down);
+
+            advanceGhost(g_ghost, dt);
+            if (g_ghostDied || g_ghost->m_isDead) {
+                result.diedBeforeInput = tick < delay;
+                break;
+            }
+
+            checkGhost(layer, g_ghost, dt);
+            if (g_ghostDied || g_ghost->m_isDead) {
+                result.diedBeforeInput = tick < delay;
+                break;
+            }
+
+            if (tick < delay) continue;
+            ++result.survived;
+
+            if (flying) continue;
+            if (!g_ghost->m_isOnGround) {
+                ++airTicks;
+                groundTicks = 0;
+                continue;
+            }
+            if (airTicks < 6) continue;
+            if (groundTicks > 2) {
+                result.survived = horizon;
+                break;
+            }
+            ++groundTicks;
+        }
+
+        g_simulating = false;
+        return result;
+    }
+
+    // Searches only the configured 1..max window. A delay is chosen only when
+    // the no-delay path dies sooner and the delayed path survives a meaningful
+    // extra stretch; otherwise the original input passes now.
+    int findSafeDelay(PlayLayer* layer, PlayerObject* player, bool down) {
+        bool wave = player->m_isDart;
+        bool miniWave = wave && player->m_vehicleSize < 1.f;
+        const int horizon = miniWave ? kMiniWaveHorizon : (wave ? kWaveHorizon : kCubeHorizon);
+
+        auto immediate = simulate(layer, player, down, 0, horizon);
+        if (!immediate.supported || immediate.survived >= horizon) return 0;
+
+        const int maxDelay = getMaxDelay();
+        if (!wave) {
+            const int target = std::min(horizon, immediate.survived + 12);
+            for (int delay = 1; delay <= maxDelay; ++delay) {
+                auto candidate = simulate(layer, player, down, delay, horizon);
+                if (!candidate.supported || candidate.diedBeforeInput) break;
+                if (candidate.survived >= target) return delay;
+            }
+        }
+        else {
+            int target = immediate.survived + 10;
+            int gain = 6;
+            for (int delay = 1; delay <= maxDelay; ++delay) {
+                auto candidate = simulate(layer, player, down, delay, horizon);
+                if (!candidate.supported || candidate.diedBeforeInput) break;
+                bool safeImprovement = candidate.survived < horizon
+                    ? candidate.survived >= target
+                    : (candidate.survived - immediate.survived >= gain || candidate.survived >= target);
+                if (safeImprovement) return delay;
+                target += 2;
+                gain += 2;
+            }
+        }
+        return 0;
+    }
+
+    void sendButton(GJBaseGameLayer* layer, bool down, bool isPlayer1, int button) {
+        if (!layer) return;
+        g_injecting = true;
+        layer->handleButton(down, button, isPlayer1);
+        g_injecting = false;
+    }
+
+    void flushOne(GJBaseGameLayer* layer, PendingInput& input) {
+        if (!input.active) return;
+        bool sendOppositeNext = input.oppositeQueued;
+        bool nextState = !input.state;
+        input.active = false;
+        input.oppositeQueued = false;
+        sendButton(layer, input.state, input.isPlayer1, input.button);
+        if (sendOppositeNext) {
+            input.active = true;
+            input.ticksRemaining = 1;
+            input.state = nextState;
+        }
+    }
+
+    void flushAll(GJBaseGameLayer* layer) {
+        for (auto& input : g_pending) flushOne(layer, input);
+    }
+
+    // 0 = not handled here (Classic buffering takes over),
+    // 1 = the input was queued or held back, 2 = pass it to the game now.
+    int interceptInput(GJBaseGameLayer* self, bool down, int button, bool isPlayer1) {
+        if (!isEnabled() || button != kJumpButton || !isPlayer1) return 0;
+
+        auto* pending = pendingFor(isPlayer1);
+        if (pending->active) {
+            pending->oppositeQueued = pending->state != down;
+            return 1;
+        }
+
+        auto* layer = PlayLayer::get();
+        auto* player = self->m_player1;
+        if (!layer || static_cast<GJBaseGameLayer*>(layer) != self
+            || !isSupportedPlayer(player, layer, isPlayer1)) {
+            return 0;
+        }
+
+        // Cube releases do not create a new jump; robot and wave releases do
+        // change the trajectory and are therefore tested like presses.
+        if (!down && !player->m_isRobot && !player->m_isDart) return 2;
+
+        const int delay = findSafeDelay(layer, player, down);
+        if (delay <= 0) return 2;
+
+        pending->active = true;
+        pending->ticksRemaining = delay;
+        pending->state = down;
+        pending->oppositeQueued = false;
+        pending->isPlayer1 = isPlayer1;
+        pending->button = button;
+        return 1;
     }
 }
 
-// How long the learned robot jump was held, in steps (0 if unknown).
-static int smartHold(std::string const& key) {
-    auto it = g_tmplHold.find(key);
-    if (it != g_tmplHold.end()) return it->second;
-    int h = std::atoi(Mod::get()->getSavedValue<std::string>("hold-" + key, "").c_str());
-    if (h > 0) g_tmplHold[key] = h;
-    return h;
-}
-
-// Tells the player why a jump could not be learned (only until it is calibrated).
-static void smartNote(PlayerObject* p, char const* msg) {
-    if (smartTemplate(smartKey(p))) return;
-    Notification::create(msg, NotificationIcon::Warning, 2.0f)->show();
+static void pbFlushNow() {
+    if (auto pl = PlayLayer::get()) pb::flushAll(pl);
 }
 
 // ---- tabbed settings panel -----------------------------------------------
@@ -1787,13 +2003,9 @@ static constexpr PRow ROWS_FLY[] = {
     {"UFO style", "ufo-style", 'c', 0, 0, WAVE_NAMES, WAVE_MODE_COUNT},
     {"Swing style", "swing-style", 'c', 0, 0, WAVE_NAMES, WAVE_MODE_COUNT},
 };
-static constexpr PRow ROWS_SMART[] = {
-    {"Smart Jump", "smart-jump", 'b', 0, 0, nullptr, 0},
-    {"Look-ahead (ticks)", "smart-window", 'n', 1, 40, nullptr, 0},
-    {"Safety margin", "smart-margin", 'n', 0, 6, nullptr, 0},
-    {"Pick timing", "smart-pick", 'c', 0, 0, SMART_PICK_NAMES, 2},
-    {"Smart Wave", "smart-wave", 'b', 0, 0, nullptr, 0},
-    {"Wave look-ahead", "smart-wave-window", 'n', 1, 16, nullptr, 0},
+static constexpr PRow ROWS_PREDICT[] = {
+    {"Predictive buffer", "predictive", 'b', 0, 0, nullptr, 0},
+    {"Max delay (frames)", "predictive-delay", 'n', 1, 16, nullptr, 0},
 };
 static constexpr PRow ROWS_EXTRAS[] = {
     {"Buffer on/off", "enabled", 'b', 0, 0, nullptr, 0},
@@ -1811,7 +2023,7 @@ static constexpr PRow ROWS_TOOLS[] = {
     {"Debug logging", "debug", 'b', 0, 0, nullptr, 0},
 };
 static constexpr char const* EXTRA_DEFAULTS =
-    "inject-hold=Short|rering=0|coyote-ticks=0|smart-jump=0|smart-window=12|smart-margin=0|smart-pick=Middle|robot-minhold=0|smart-wave=0|smart-wave-window=4";
+    "inject-hold=Short|rering=0|coyote-ticks=0|robot-minhold=0|predictive=0|predictive-delay=2";
 
 // Shows how early your buffered clicks were and suggests a window for each mode.
 class StatsPopup : public geode::Popup {
@@ -1898,7 +2110,7 @@ public:
 // One window for every setting, split into tabs.
 class PanelPopup : public geode::Popup {
 protected:
-    static constexpr char const* TAB_NAMES[5] = {"Buffer", "Fly", "Smart", "Extras", "Tools"};
+    static constexpr char const* TAB_NAMES[5] = {"Buffer", "Fly", "Predict", "Extras", "Tools"};
     int m_tab = 0;
     int m_levelID = 0;
     std::vector<CCNode*> m_nodes;
@@ -1943,7 +2155,7 @@ protected:
         switch (m_tab) {
             case 0: m_rows = ROWS_BUFFER; m_rowCount = static_cast<int>(std::size(ROWS_BUFFER)); break;
             case 1: m_rows = ROWS_FLY; m_rowCount = static_cast<int>(std::size(ROWS_FLY)); break;
-            case 2: m_rows = ROWS_SMART; m_rowCount = static_cast<int>(std::size(ROWS_SMART)); break;
+            case 2: m_rows = ROWS_PREDICT; m_rowCount = static_cast<int>(std::size(ROWS_PREDICT)); break;
             case 3: m_rows = ROWS_EXTRAS; m_rowCount = static_cast<int>(std::size(ROWS_EXTRAS)); break;
             default: m_rows = ROWS_TOOLS; m_rowCount = static_cast<int>(std::size(ROWS_TOOLS)); break;
         }
@@ -1974,13 +2186,7 @@ protected:
         }
 
         if (m_tab == 2) {
-            std::string st = "Learns jumps from your own jumps (cube, robot). Wave needs no setup.";
-            if (auto pl = PlayLayer::get(); pl && pl->m_player1) {
-                st = smartTemplate(smartKey(pl->m_player1))
-                    ? "Calibrated for this icon size and gravity."
-                    : "Not calibrated yet: jump once on flat ground.";
-            }
-            m_note->setString(st.c_str());
+            m_note->setString("Delays are game updates. Replaces Classic for cube, ball, robot, spider, wave.");
         } else if (m_tab == 4) {
             addButton("Profiles", -75.f, -10.f, menu_selector(PanelPopup::onProfiles));
             addButton("Sections", 75.f, -10.f, menu_selector(PanelPopup::onSections));
@@ -2132,11 +2338,13 @@ class $modify(BufferPause, PauseLayer) {
 // layer clears its state on the next step.
 class $modify(BufferReset, PlayLayer) {
     void resetLevel() {
+        pb::resetPending();
         PlayLayer::resetLevel();
         g_resetEpoch++;
     }
 
     void resetLevelFromStart() {
+        pb::resetPending();
         PlayLayer::resetLevelFromStart();
         g_resetEpoch++;
     }
@@ -2147,6 +2355,13 @@ class $modify(BufferReset, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
+        // The hidden player used for prediction "dies" without touching the level.
+        if (pb::g_simulating && player == pb::g_ghost) {
+            pb::g_ghostDied = true;
+            player->m_isDead = true;
+            return;
+        }
+        if (player == m_player1) pb::resetPending();
         PlayLayer::destroyPlayer(player, object);
         g_resetEpoch++;
         g_lastDeathPct = this->getCurrentPercent();
@@ -2165,6 +2380,18 @@ class $modify(BufferReset, PlayLayer) {
         DBG("[InputBuffer] Section -> {}", tok);
     }
 
+    void onQuit() {
+        auto* ghost = pb::g_ghost;
+        pb::g_ghost = nullptr;
+        pb::resetPending();
+        if (ghost && ghost->getParent()) ghost->removeFromParentAndCleanup(true);
+        PlayLayer::onQuit();
+    }
+
+    void playEndAnimationToPos(cocos2d::CCPoint position) {
+        if (!pb::g_simulating) PlayLayer::playEndAnimationToPos(position);
+    }
+
     // Leaving the level puts the player's own settings back.
     void onExit() {
         PlayLayer::onExit();
@@ -2178,8 +2405,22 @@ class $modify(BufferReset, PlayLayer) {
     void setupHasCompleted() {
         PlayLayer::setupHasCompleted();
         clearStats();
-        g_hazBuilt = false;
         buildHud(this);
+
+        // Hidden player used by the predictive buffer.
+        if (pb::g_ghost && pb::g_ghost->getParent()) pb::g_ghost->removeFromParentAndCleanup(true);
+        pb::g_ghost = nullptr;
+        if (m_objectLayer) {
+            pb::g_ghost = PlayerObject::create(1, 1, this, this, true);
+            if (pb::g_ghost) {
+                pb::g_ghost->setVisible(false);
+                pb::g_ghost->m_playEffects = false;
+                pb::g_ghost->m_hasGroundParticles = false;
+                pb::g_ghost->m_hasShipParticles = false;
+                m_objectLayer->addChild(pb::g_ghost);
+            }
+        }
+        pb::resetPending();
         if (!m_level) return;
         int id = levelKeyFor(m_level);
         if (id == 0) return;
@@ -2225,25 +2466,6 @@ struct PState {
     int releaseNextAt = 0;       // when the injected click lets go
     int lastGroundStep = -1000000;
     bool coyoteFire = false;     // a late click is waiting to be injected
-
-    // Smart Jump
-    bool haveLast = false;
-    int lastStep = -1;
-    float lastX = 0.f, lastY = 0.f;
-    bool wasGround = false;
-    bool jrec = false;           // recording a real jump
-    float jy0 = 0.f, jsgn = 1.f, jd2 = 0.f;
-    std::vector<float> jT;
-    bool smartFire = false;      // a delayed click is on its way
-    int smartFireAt = 0;
-    int sjFireStep = -1;         // when we last fired, to measure liftoff latency
-    int smartHold = 0;           // robot: how long the fired click is held (steps)
-
-    // Smart Wave
-    bool wHave = false;
-    int wLastStep = -1;
-    float wLastX = 0.f, wLastY = 0.f;
-    bool swQueued = false;       // the queue holds retimed inputs of ours
 
     // Robot minimum hold: a quick release is held back so the jump is not cut short.
     bool robotRelease = false;
@@ -2342,314 +2564,11 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         return std::clamp(s.lastHoldSteps, 1, cap);
     }
 
-    // Watches the cube to measure its speed and to learn the shape of a real
-    // jump (height per step) from the player's own jumps.
-    void smartObserve(PlayerObject* p, PState& s, int step) {
-        int mi = modeIndex(p);
-        if (!g_smart || (mi != 0 && mi != 2) || sharedDualInput()) {
-            s.haveLast = false;
-            s.jrec = false;
-            return;
-        }
-        bool robot = mi == 2; // robot height depends on the hold, so its jump shape is not a plain arc
-        auto pos = p->getPosition();
-        float x = pos.x, y = pos.y;
-        bool ground = p->m_isOnGround;
-        float sgn = p->m_isUpsideDown ? -1.f : 1.f;
-        // A click is queued with a timestamp and can be applied a few steps
-        // after it arrived, so the jump may show up several steps later.
-        int pressWin = std::max(12, static_cast<int>(std::lround(16 * stepsPerTick())));
-
-        if (s.haveLast && step == s.lastStep + 1) {
-            float dx = x - s.lastX;
-            if (dx > 0.01f) g_vx = dx;
-        }
-
-        if (s.jrec) {
-            bool bad = sgn != s.jsgn || ringsTouching(p) > 0 || s.jT.size() > 600;
-            if (bad) {
-                s.jrec = false;
-                smartNote(p, "Smart Jump: jump touched a ring or gravity changed. Try again.");
-            } else if (ground) {
-                if (s.jT.size() >= 8 && std::fabs((y - s.jy0) * sgn) < 1.5f) {
-                    bool had = smartTemplate(smartKey(p)) != nullptr;
-                    int hold = 0;
-                    if (robot) hold = s.held ? std::max(1, step - s.realPressStep) : s.lastHoldSteps;
-                    smartStore(smartKey(p), s.jT, hold);
-                    log::info("[InputBuffer] smart jump: learned a jump of {} steps ({})", s.jT.size(), smartKey(p));
-                    if (!had) Notification::create("Smart Jump: learned your jump", NotificationIcon::Success, 2.0f)->show();
-                } else {
-                    smartNote(p, "Smart Jump: jump was too short or landed at another height. Try on flat ground.");
-                }
-                s.jrec = false;
-            } else {
-                float dy = (y - s.jy0) * sgn;
-                size_t n = s.jT.size();
-                if (!robot && n >= 3) {
-                    float d2 = dy - 2.f * s.jT[n - 1] + s.jT[n - 2];
-                    if (n == 3) s.jd2 = d2;
-                    else if (std::fabs(d2 - s.jd2) > std::max(0.0005f, 0.5f * std::fabs(s.jd2))) {
-                        s.jrec = false;
-                        smartNote(p, "Smart Jump: jump shape was not smooth. Try again on flat ground.");
-                    }
-                }
-                if (s.jrec) s.jT.push_back(dy);
-            }
-        } else if (s.haveLast && s.wasGround && !ground && step == s.lastStep + 1 &&
-                   (y - s.lastY) * sgn > (robot ? 0.05f : 0.2f) &&
-                   (step - s.realPressStep <= pressWin || s.sjFireStep >= 0)) {
-            s.jrec = true;
-            s.jy0 = s.lastY;
-            s.jsgn = sgn;
-            s.jd2 = 0.f;
-            s.jT.clear();
-            s.jT.push_back((y - s.lastY) * sgn);
-            if (s.sjFireStep >= 0) {
-                g_sjLat = std::clamp(step - 1 - s.sjFireStep, 0, 3);
-                s.sjFireStep = -1;
-            }
-        } else if (!s.jrec && s.haveLast && s.wasGround && !ground && step == s.lastStep + 1 &&
-                   (y - s.lastY) * sgn > 0.2f) {
-            smartNote(p, "Smart Jump: that jump did not come from your click (pad or orb?).");
-        }
-
-        s.wasGround = ground;
-        s.lastX = x;
-        s.lastY = y;
-        s.lastStep = step;
-        s.haveLast = true;
-    }
-
-    // Collects the deadly objects of the level once.
-    void ensureHazards() {
-        if (g_hazBuilt) return;
-        g_hazBuilt = true;
-        g_haz.clear();
-        if (!m_objects) return;
-        for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
-            if (!obj || obj->m_objectType != GameObjectType::Hazard || obj->m_isNoTouch) continue;
-            Hz h{};
-            auto c = obj->getPosition();
-            if (obj->m_objectRadius > 0.f) {
-                h.circle = true;
-                h.cx = c.x;
-                h.cy = c.y;
-                h.r = obj->m_objectRadius;
-                h.minx = c.x - h.r;
-                h.maxx = c.x + h.r;
-                h.miny = c.y - h.r;
-                h.maxy = c.y + h.r;
-            } else {
-                auto r = obj->getObjectRect();
-                if (r.size.width < 0.5f || r.size.height < 0.5f) r = CCRect(c.x - 6.f, c.y - 6.f, 12.f, 12.f);
-                h.minx = r.getMinX();
-                h.maxx = r.getMaxX();
-                h.miny = r.getMinY();
-                h.maxy = r.getMaxY();
-            }
-            g_haz.push_back(h);
-        }
-        std::sort(g_haz.begin(), g_haz.end(), [](Hz const& a, Hz const& b) { return a.minx < b.minx; });
-        log::info("[InputBuffer] smart jump: cached {} hazards", g_haz.size());
-    }
-
-    // Returns how many steps to wait before firing the click, or -1 to let the
-    // click go through untouched.
-    int smartDecide(PlayerObject* p, PState& s, int step, int& holdOut) {
-        holdOut = 0;
-        int mi = modeIndex(p);
-        if (!g_smart || (mi != 0 && mi != 2) || !p->m_isOnGround || sharedDualInput()) return -1;
-        if (g_vx <= 0.05f) return -1;
-        std::string key = smartKey(p);
-        auto tm = smartTemplate(key);
-        if (!tm) {
-            DBG("[InputBuffer] smart jump: not calibrated for {} (jump once first)", key);
-            return -1;
-        }
-        if (mi == 2) {
-            // Robot: the fired click is held as long as the learned jump was held.
-            holdOut = smartHold(key);
-            if (holdOut <= 0) return -1;
-        }
-        ensureHazards();
-        if (g_haz.empty()) return -1;
-
-        auto pos = p->getPosition();
-        float x0 = pos.x, y0 = pos.y;
-        CCRect pr = p->getObjectRect();
-        float pw = pr.size.width, ph = pr.size.height;
-        float offx = pr.getMidX() - pos.x, offy = pr.getMidY() - pos.y;
-        if (pw < 2.f || ph < 2.f) {
-            pw = ph = 30.f * p->getScale();
-            offx = offy = 0.f;
-        }
-        float sgn = p->m_isUpsideDown ? -1.f : 1.f;
-        int N = static_cast<int>(tm->size());
-        int W = std::max(1, static_cast<int>(std::lround(g_smartWindow * stepsPerTick())));
-        int lat = g_sjLat;
-        float margin = static_cast<float>(g_smartMargin);
-        float vx = g_vx;
-        int total = 1 + W + lat + N + 2;
-
-        float xmax = x0 + vx * total + pw + 40.f;
-        std::vector<Hz const*> nearby;
-        auto it = std::lower_bound(g_haz.begin(), g_haz.end(), x0 - 300.f,
-                                   [](Hz const& h, float v) { return h.minx < v; });
-        for (; it != g_haz.end() && it->minx <= xmax; ++it) nearby.push_back(&*it);
-        if (nearby.empty()) return -1;
-
-        // Would starting the jump d steps from now survive?
-        auto survives = [&](int d) {
-            int O = 1 + d + lat;            // step the icon lifts off
-            int last = O + N + 1;
-            for (int m = 1; m <= last; m++) {
-                float cx = x0 + vx * m + offx;
-                float dy = 0.f;
-                if (m >= O) {
-                    int k = m - O + 1;
-                    if (k <= N) dy = (*tm)[k - 1];
-                }
-                float cy = y0 + sgn * dy + offy;
-                float l = cx - pw * 0.5f, r = cx + pw * 0.5f;
-                float b = cy - ph * 0.5f, t = cy + ph * 0.5f;
-                for (auto h : nearby) {
-                    if (r < h->minx - margin || l > h->maxx + margin) continue;
-                    if (h->circle) {
-                        float qx = std::clamp(h->cx, l, r), qy = std::clamp(h->cy, b, t);
-                        float ddx = qx - h->cx, ddy = qy - h->cy;
-                        float rr = h->r + margin;
-                        if (ddx * ddx + ddy * ddy < rr * rr) return false;
-                    } else if (b < h->maxy + margin && t > h->miny - margin) {
-                        return false;
-                    }
-                }
-            }
-            return true;
-        };
-
-        if (survives(0)) return -1; // the click as it is already clears everything
-
-        int a = -1;
-        for (int d = 1; d <= W; d++) {
-            if (survives(d)) { a = d; break; }
-        }
-        if (a < 0) {
-            DBG("[InputBuffer] smart jump: no safe start within {} steps, click passed through", W);
-            return -1;
-        }
-        int b = a;
-        while (b + 1 <= W && survives(b + 1)) b++;
-        int pick = g_smartEarliest ? a : a + (b - a) / 2;
-        DBG("[InputBuffer] smart jump: delaying click {} steps (safe {}..{}, window {})", pick, a, b, W);
-        return pick;
-    }
-
-    // Measures the wave's real speed (horizontal and vertical units per step).
-    void smartObserveWave(PlayerObject* p, PState& s, int step) {
-        auto pos = p->getPosition();
-        if (s.wHave && step == s.wLastStep + 1) {
-            float dx = pos.x - s.wLastX, dy = pos.y - s.wLastY;
-            if (dx > 0.01f) g_vx = dx;
-            if (std::fabs(dy) > 0.2f) g_wvy = std::fabs(dy);
-        }
-        s.wLastX = pos.x;
-        s.wLastY = pos.y;
-        s.wLastStep = step;
-        s.wHave = true;
-    }
-
-    // Wave: if turning now would fly into a hazard but turning a few steps
-    // later would not, returns how many steps to wait; otherwise -1. It assumes
-    // the wave keeps its new direction for a short while after the turn.
-    int smartWaveDecide(PlayerObject* p, PState& s, int step, bool down) {
-        if (!g_smartWave || sharedDualInput() || s.held == down) return -1;
-        if (g_vx <= 0.05f || g_wvy <= 0.05f) return -1;
-        ensureHazards();
-        if (g_haz.empty()) return -1;
-
-        auto pos = p->getPosition();
-        float x0 = pos.x, y0 = pos.y;
-        CCRect pr = p->getObjectRect();
-        float pw = pr.size.width, ph = pr.size.height;
-        float offx = pr.getMidX() - pos.x, offy = pr.getMidY() - pos.y;
-        if (pw < 1.f || ph < 1.f) {
-            pw = ph = 10.f * p->getScale();
-            offx = offy = 0.f;
-        }
-        float sgn = p->m_isUpsideDown ? -1.f : 1.f;
-        int W = std::max(1, static_cast<int>(std::lround(g_smartWaveWindow * stepsPerTick())));
-        int H = std::max(8, static_cast<int>(std::lround(16 * stepsPerTick())));
-        float margin = static_cast<float>(g_smartMargin);
-        float vx = g_vx, vy = g_wvy;
-        bool wasHeld = s.held;
-
-        float xmax = x0 + vx * (1 + W + H) + pw + 40.f;
-        std::vector<Hz const*> nearby;
-        auto it = std::lower_bound(g_haz.begin(), g_haz.end(), x0 - 300.f,
-                                   [](Hz const& h, float v) { return h.minx < v; });
-        for (; it != g_haz.end() && it->minx <= xmax; ++it) nearby.push_back(&*it);
-        if (nearby.empty()) return -1;
-
-        auto survives = [&](int d) {
-            float y = y0;
-            int last = 1 + d + H;
-            for (int m = 1; m <= last; m++) {
-                bool heldNow = (m <= d) ? wasHeld : down;
-                y += (heldNow ? 1.f : -1.f) * sgn * vy;
-                float cx = x0 + vx * m + offx, cy = y + offy;
-                float l = cx - pw * 0.5f, r = cx + pw * 0.5f;
-                float b = cy - ph * 0.5f, t = cy + ph * 0.5f;
-                for (auto h : nearby) {
-                    if (r < h->minx - margin || l > h->maxx + margin) continue;
-                    if (h->circle) {
-                        float qx = std::clamp(h->cx, l, r), qy = std::clamp(h->cy, b, t);
-                        float ddx = qx - h->cx, ddy = qy - h->cy;
-                        float rr = h->r + margin;
-                        if (ddx * ddx + ddy * ddy < rr * rr) return false;
-                    } else if (b < h->maxy + margin && t > h->miny - margin) {
-                        return false;
-                    }
-                }
-            }
-            return true;
-        };
-
-        if (survives(0)) return -1;
-        int a = -1;
-        for (int d = 1; d <= W; d++) {
-            if (survives(d)) { a = d; break; }
-        }
-        if (a < 0) return -1;
-        int b = a;
-        while (b + 1 <= W && survives(b + 1)) b++;
-        int pick = g_smartEarliest ? a : a + (b - a) / 2;
-        DBG("[InputBuffer] smart wave: delaying {} {} steps (safe {}..{}, window {})",
-            down ? "press" : "release", pick, a, b, W);
-        return pick;
-    }
-
     void stepPlayer(PlayerObject* p, PState& s, int idx) {
         int step = m_fields->step;
         char const* tag = idx == 0 ? "P1" : "P2";
 
         if (isGroundMode(p) && p->m_isOnGround) s.lastGroundStep = step;
-        if (idx == 0) smartObserve(p, s, step);
-        if (idx == 0 && g_smartWave && modeIndex(p) == MODE_WAVE) smartObserveWave(p, s, step);
-        else s.wHave = false;
-
-        // Smart Jump: the held-back click goes out at the chosen tick.
-        if (s.smartFire && step >= s.smartFireAt) {
-            s.smartFire = false;
-            if (isGroundMode(p) && p->m_isOnGround) {
-                sendInput(p, true);
-                s.releaseNext = true;
-                s.releaseNextAt = step + (s.smartHold > 0 ? s.smartHold : injectHoldSteps(s));
-                s.sjFireStep = step;
-                DBG("[InputBuffer] {} SMART JUMP click at step {}", tag, step);
-                showText("SMART");
-            }
-        }
-
         // Robot minimum hold: the held-back release goes out now.
         if (s.robotRelease && (step >= s.robotReleaseAt || modeIndex(p) != 2)) {
             s.robotRelease = false;
@@ -2790,28 +2709,6 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             flushWaveQueue(p, s, idx);
         }
 
-        // Smart Wave: retime a turn that would hit a hazard. Later inputs queue
-        // behind a retimed one so the order is kept.
-        if (g_smartWave && idx == 0 && modeIndex(p) == MODE_WAVE && step >= m_fields->graceUntil) {
-            if (!s.waveQueue.empty()) {
-                if (s.swQueued) {
-                    int target = std::max(step + 1, s.waveQueue.back().second + 1);
-                    s.held = down;
-                    s.waveQueue.emplace_back(down, target);
-                    return true;
-                }
-            } else {
-                s.swQueued = false;
-                int d = smartWaveDecide(p, s, step, down);
-                if (d > 0) {
-                    s.held = down;
-                    s.swQueued = true;
-                    s.waveQueue.emplace_back(down, step + 1 + d);
-                    return true;
-                }
-            }
-        }
-
         int n = modeLimitSteps(p);
         int style = styleFor(p);
         bool inGrace = step < m_fields->graceUntil;
@@ -2874,22 +2771,6 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             }
         }
 
-        // Smart Jump (cube): if starting the jump now would hit a hazard but a
-        // slightly later start clears it, hold the click back and fire it then.
-        if (down && g_smart && idx == 0) {
-            if (s.smartFire) return true; // one is already on its way
-            int hold = 0;
-            int d = smartDecide(p, s, step, hold);
-            if (d > 0) {
-                s.smartHold = hold;
-                s.held = true;
-                s.pending = false;
-                s.smartFire = true;
-                s.smartFireAt = step + 1 + d;
-                return true;
-            }
-        }
-
         // Late click (coyote time): a press a few ticks after walking off an
         // edge still counts. Not while rising, and not while on a ring.
         if (down && g_coyote > 0 && isGroundMode(p) && !p->m_isOnGround && ringsTouching(p) == 0) {
@@ -2948,6 +2829,22 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         auto f = m_fields.operator->();
         syncState();
 
+        // Predictive buffer: replaces Classic for the contexts it supports.
+        if (pb::g_simulating || pb::g_injecting) {
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            return;
+        }
+        if (!pb::isEnabled()) {
+            pb::flushAll(this);
+        } else {
+            int r = pb::interceptInput(this, down, button, isPlayer1);
+            if (r == 1) return;
+            if (r == 2) {
+                GJBaseGameLayer::handleButton(down, button, isPlayer1);
+                return;
+            }
+        }
+
         // Switched off, or legit mode: plain game input.
         if (PlayLayer::get() && button == 1 && !assistAllowed()) {
             bypassCleanup();
@@ -2997,5 +2894,106 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         }
 
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
+
+    // ---- predictive buffer: keep the hidden player from touching the level ----
+    void collisionCheckObjects(PlayerObject* player, gd::vector<GameObject*>* objects, int objectCount, float dt) {
+        if (!pb::g_simulating || player != pb::g_ghost) {
+            GJBaseGameLayer::collisionCheckObjects(player, objects, objectCount, dt);
+            return;
+        }
+
+        if (!objects) return;
+        static gd::vector<GameObject*> relevant;
+        relevant.clear();
+        int limit = std::clamp(objectCount, 0, static_cast<int>(objects->size()));
+        if (static_cast<int>(relevant.capacity()) < limit) relevant.reserve(static_cast<size_t>(limit));
+        for (int index = 0; index < limit; ++index) {
+            auto* object = (*objects)[static_cast<size_t>(index)];
+            if (pb::isCollisionRelevant(object)) relevant.push_back(object);
+        }
+        GJBaseGameLayer::collisionCheckObjects(player, &relevant, static_cast<int>(relevant.size()), dt);
+    }
+
+    bool canBeActivatedByPlayer(PlayerObject* player, EffectGameObject* object) {
+        if (pb::g_simulating) return false;
+        return GJBaseGameLayer::canBeActivatedByPlayer(player, object);
+    }
+
+    void playerTouchedRing(PlayerObject* player, RingObject* object) {
+        if (pb::g_simulating) return;
+        GJBaseGameLayer::playerTouchedRing(player, object);
+    }
+
+    void playerTouchedTrigger(PlayerObject* player, EffectGameObject* object) {
+        if (pb::g_simulating) return;
+        GJBaseGameLayer::playerTouchedTrigger(player, object);
+    }
+
+    void activateSFXTrigger(SFXTriggerGameObject* object) {
+        if (!pb::g_simulating) GJBaseGameLayer::activateSFXTrigger(object);
+    }
+
+    void activateSongEditTrigger(SongTriggerGameObject* object) {
+        if (!pb::g_simulating) GJBaseGameLayer::activateSongEditTrigger(object);
+    }
+
+    void gameEventTriggered(GJGameEvent event, int material, int playerID) {
+        if (!pb::g_simulating) GJBaseGameLayer::gameEventTriggered(event, material, playerID);
+    }
+};
+
+class $modify(PredictiveEffectObject, EffectGameObject) {
+    void triggerObject(GJBaseGameLayer* layer, int id, gd::vector<int> const* groups) {
+        if (!pb::g_simulating) EffectGameObject::triggerObject(layer, id, groups);
+    }
+};
+
+class $modify(PredictiveGameObject, GameObject) {
+    void playShineEffect() {
+        if (!pb::g_simulating) GameObject::playShineEffect();
+    }
+};
+
+class $modify(PredictiveHardStreak, HardStreak) {
+    void addPoint(cocos2d::CCPoint point) {
+        if (!pb::g_simulating) HardStreak::addPoint(point);
+    }
+};
+
+class $modify(PredictivePlayerObject, PlayerObject) {
+    void update(float dt) {
+        if (!pb::g_simulating) {
+            auto* layer = PlayLayer::get();
+            if (layer && this == layer->m_player1 && std::isfinite(dt) && dt > 0.f) {
+                float warp = layer->m_gameState.m_timeWarp;
+                pb::g_frameDelta = warp > 0.f ? dt / warp : dt;
+            }
+            if (layer && this == layer->m_player1) {
+                if (!pb::isEnabled()) {
+                    pb::flushAll(layer);
+                }
+                else {
+                    for (auto& input : pb::g_pending) {
+                        if (!input.active) continue;
+                        if (input.ticksRemaining > 0) --input.ticksRemaining;
+                        if (input.ticksRemaining <= 0) pb::flushOne(layer, input);
+                    }
+                }
+            }
+        }
+        PlayerObject::update(dt);
+    }
+
+    void incrementJumps() {
+        if (!pb::g_simulating) PlayerObject::incrementJumps();
+    }
+
+    void playSpiderDashEffect(cocos2d::CCPoint from, cocos2d::CCPoint to) {
+        if (!pb::g_simulating) PlayerObject::playSpiderDashEffect(from, to);
+    }
+
+    void ringJump(RingObject* ring, bool skipCheck) {
+        if (!pb::g_simulating) PlayerObject::ringJump(ring, skipCheck);
     }
 };
