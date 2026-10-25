@@ -5,7 +5,7 @@
     },
     "id": "lyophi.buffermod",
     "name": "Input Buffer",
-    "version": "v1.6.0",
+    "version": "v1.7.0",
     "developer": "Lyophi",
     "description": "Predictive input buffering for Geometry Dash. Early clicks are remembered and fired when you land or touch an orb, and ship, UFO, swing and wave get smoother, more consistent timing.",
     "settings": {
@@ -263,53 +263,22 @@
             "max": 32,
             "control": { "input": true, "arrows": true, "slider": false }
         },
-        "sec-smart": {
+        "sec-predict": {
             "type": "title",
-            "name": "Smart Jump (cube and robot)",
-            "description": "Looks at the spikes and saws ahead. If your ground click would hit one but a slightly later jump would clear it, the click is held back and fired at the safe tick. It learns your jump from your own jumps, so jump once on flat ground first. For the robot, jump once the way you usually hold it: the mod repeats that jump height and hold. Spikes and saws only: solid blocks, orbs and pads are not predicted."
+            "name": "Predictive Buffer",
+            "description": "On a hidden copy of the player, the game's own collision code is run for the next few updates. If your click as it is would die but waiting 1 to Maximum Delay updates would not, the click is queued for the earliest safe update. If no delay in that window is safe, the click goes through at once, so it will not save a click that is too early for the window. Replaces Classic buffering for cube, ball, robot, spider and wave. Dual, platformer, ship and dashing use Classic. Triggers and moving objects cannot be fully reproduced in the simulation."
         },
-        "smart-jump": {
+        "predictive": {
             "type": "bool",
-            "name": "Smart Jump (Experimental)",
-            "description": "Turns Smart Jump on. Cube and robot. Off by default.",
+            "name": "Enable Predictive Buffer",
+            "description": "Turns the predictive buffer on or off without restarting. Turning it off sends any queued click right away. Off by default.",
             "default": false
         },
-        "smart-window": {
+        "predictive-delay": {
             "type": "int",
-            "name": "Smart Look-ahead (ticks)",
-            "description": "How many ticks later than your click the mod may start the jump.",
-            "default": 12,
-            "min": 1,
-            "max": 40,
-            "control": { "input": true, "arrows": true, "slider": false }
-        },
-        "smart-margin": {
-            "type": "int",
-            "name": "Smart Safety Margin",
-            "description": "Extra space kept around hazards, in game units. 0 trusts the hitboxes exactly. Raise it if you still clip spikes, but a big margin can leave no safe timing.",
-            "default": 0,
-            "min": 0,
-            "max": 6,
-            "control": { "input": true, "arrows": true, "slider": false }
-        },
-        "smart-pick": {
-            "type": "string",
-            "name": "Smart Timing Pick",
-            "description": "**Middle**: the middle of the safe timings, the most forgiving.\n**Earliest**: the first safe tick.",
-            "default": "Middle",
-            "one-of": ["Middle", "Earliest"]
-        },
-        "smart-wave": {
-            "type": "bool",
-            "name": "Smart Wave (Experimental)",
-            "description": "In wave, if turning right now would fly into a spike or saw but turning a few ticks later would not, your click or release is held back and fired at the safe tick. It watches spikes and saws only (not block corridors or slopes) and assumes the wave keeps its new direction for a short while. Off by default.",
-            "default": false
-        },
-        "smart-wave-window": {
-            "type": "int",
-            "name": "Smart Wave Look-ahead (ticks)",
-            "description": "How many ticks later than your input a wave turn may be fired.",
-            "default": 4,
+            "name": "Maximum Delay (frames)",
+            "description": "How many game updates ahead to search, 1 to 16. With 2, only delays of 1 and 2 updates are tested; a click that needs 3 passes through untouched. Bigger values save earlier clicks but cost more work on each click.",
+            "default": 2,
             "min": 1,
             "max": 16,
             "control": { "input": true, "arrows": true, "slider": false }
