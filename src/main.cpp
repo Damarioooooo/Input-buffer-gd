@@ -64,6 +64,21 @@ static bool g_debug = false;
 // Off by default. Real 2-player levels are not affected by this.
 static bool g_dualEnabled = false;
 
+// Extras (v1.2): master switch, injected-click hold, ring re-press, coyote
+// time, legit mode, on-screen buttons and click feedback.
+static bool g_enabled = true;
+static bool g_injectMirror = false;   // injected click mirrors the real hold length
+static bool g_rering = false;         // re-press when a held click reaches a ring
+static int g_coyote = 0;              // late-click window in ticks (0 = off)
+static constexpr char const* LEGIT_NAMES[] = {"Off", "Rated levels", "All levels"};
+static int g_legit = 0;
+static bool g_hud = false;
+static constexpr char const* HUD_POS_NAMES[] = {"Top Left", "Top Right", "Bottom Left", "Bottom Right"};
+static int g_hudPos = 1;
+static bool g_feedback = true;
+static constexpr int INJECT_CAP_TICKS = 30;
+static void refreshHud();
+
 // Hotkeys are keybind settings. Order: 0 stage, 1 tps up, 2 tps down, 3 debug, 4 wave mode, 5 add section.
 static constexpr int KEYBIND_COUNT = 6;
 static constexpr char const* KEYBIND_SETTINGS[] = {"kb-stage", "kb-tps-up", "kb-tps-down", "kb-debug", "kb-wave", "kb-section"};
@@ -92,6 +107,15 @@ static void loadSettings() {
     }
     g_debug = m->getSettingValue<bool>("debug");
     g_dualEnabled = m->getSettingValue<bool>("dual-mode");
+    g_enabled = m->getSettingValue<bool>("enabled");
+    g_injectMirror = m->getSettingValue<std::string>("inject-hold") == "Mirror my hold";
+    g_rering = m->getSettingValue<bool>("rering");
+    g_coyote = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("coyote-ticks")), 0, 16);
+    g_legit = indexOf(LEGIT_NAMES, 3, m->getSettingValue<std::string>("legit-mode"), 0);
+    g_hud = m->getSettingValue<bool>("hud");
+    g_hudPos = indexOf(HUD_POS_NAMES, 4, m->getSettingValue<std::string>("hud-pos"), 1);
+    g_feedback = m->getSettingValue<bool>("feedback");
+    refreshHud();
 }
 
 static char const* waveModeName() { return WAVE_NAMES[g_waveMode]; }
@@ -222,12 +246,141 @@ static void doHotkey(int action) {
             addSectionHere();
             break;
     }
+    refreshHud();
 }
 
 static void hotkeyPressed(int action, bool down, bool repeat) {
     if (!down || repeat) return;
     if (!PlayLayer::get()) return; // hotkeys only act inside a level
     doHotkey(action);
+}
+
+// ---- extras: legit mode, stats, feedback, on-screen buttons -------------
+// The assist is skipped when it is switched off, or when legit mode says this
+// kind of run should be played raw. Practice mode and test mode always keep it.
+static bool assistAllowed() {
+    if (!g_enabled) return false;
+    if (g_legit == 0) return true;
+    auto pl = PlayLayer::get();
+    if (!pl) return true;
+    if (pl->m_isPracticeMode || pl->m_isTestMode) return true;
+    if (g_legit == 2) return false;
+    return !(pl->m_level && pl->m_level->m_stars.value() > 0);
+}
+
+// How early (in ticks) each buffered click was, for cube / ball / robot / spider.
+static std::vector<float> g_samples[4];
+static int g_expired[4] = {0, 0, 0, 0};
+
+static void clearStats() {
+    for (auto& v : g_samples) v.clear();
+    for (auto& e : g_expired) e = 0;
+}
+
+static void recordSample(int idx, float ticks) {
+    if (idx < 0 || idx > 3) return;
+    auto& v = g_samples[idx];
+    if (v.size() >= 500) v.erase(v.begin());
+    v.push_back(ticks);
+}
+
+static void recordExpired(int idx) {
+    if (idx >= 0 && idx <= 3) g_expired[idx]++;
+}
+
+// Median, 90th percentile and a suggested window for one mode.
+static bool statsFor(int i, float& med, float& p90, int& suggest) {
+    if (i < 0 || i > 3 || g_samples[i].empty()) return false;
+    auto v = g_samples[i];
+    std::sort(v.begin(), v.end());
+    med = v[v.size() / 2];
+    size_t k = std::min(v.size() - 1, static_cast<size_t>(v.size() * 0.9));
+    p90 = v[k];
+    suggest = std::clamp(static_cast<int>(std::ceil(p90)) + 1, 1, 64);
+    return true;
+}
+
+// A small "+3.2t" that fades out at the top of the screen when a buffered
+// click fires.
+static void showFeedback(float ticks) {
+    if (!g_feedback) return;
+    auto pl = PlayLayer::get();
+    if (!pl) return;
+    auto win = CCDirector::get()->getWinSize();
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "+%.1ft", ticks);
+    auto label = CCLabelBMFont::create(buf, "bigFont.fnt");
+    label->setScale(0.4f);
+    label->setColor({90, 255, 120});
+    label->setPosition({win.width / 2.f, win.height - 30.f});
+    pl->addChild(label, 1001);
+    label->runAction(CCSequence::create(
+        CCDelayTime::create(0.25f),
+        CCFadeOut::create(0.35f),
+        CCCallFunc::create(label, callfunc_selector(CCNode::removeFromParent)),
+        nullptr));
+}
+
+static ButtonSprite* g_hudToggle = nullptr;
+static ButtonSprite* g_hudWin = nullptr;
+static ButtonSprite* g_hudWave = nullptr;
+
+class HudHandler : public CCObject {
+public:
+    void onToggle(CCObject*) {
+        Mod::get()->setSettingValue<bool>("enabled", !g_enabled);
+        loadSettings();
+    }
+    void onWindow(CCObject*) { doHotkey(0); }
+    void onWave(CCObject*) { doHotkey(4); }
+};
+
+static HudHandler* hudHandler() {
+    static HudHandler* h = new HudHandler();
+    return h;
+}
+
+static void refreshHud() {
+    if (!PlayLayer::get()) {
+        g_hudToggle = g_hudWin = g_hudWave = nullptr;
+        return;
+    }
+    if (g_hudToggle) g_hudToggle->setString(g_enabled ? "ON" : "OFF");
+    if (g_hudWin) g_hudWin->setString(STAGE_NAMES[g_stage]);
+    if (g_hudWave) g_hudWave->setString(WAVE_NAMES[g_waveMode]);
+}
+
+// Three small buttons in a corner of the level: on/off, buffer window, wave
+// mode. Off by default (a button in the way can eat a tap).
+static void buildHud(PlayLayer* pl) {
+    g_hudToggle = g_hudWin = g_hudWave = nullptr;
+    if (!pl) return;
+    if (auto old = pl->getChildByID("pib-hud")) old->removeFromParent();
+    if (!g_hud) return;
+
+    auto win = CCDirector::get()->getWinSize();
+    bool top = g_hudPos == 0 || g_hudPos == 1;
+    bool left = g_hudPos == 0 || g_hudPos == 2;
+    float dir = top ? -1.f : 1.f;
+
+    auto menu = CCMenu::create();
+    menu->setID("pib-hud");
+    menu->setPosition({left ? 38.f : win.width - 38.f, top ? win.height - 24.f : 24.f});
+
+    auto add = [&](char const* label, SEL_MenuHandler cb, int row) -> ButtonSprite* {
+        auto spr = ButtonSprite::create(label);
+        spr->setScale(0.4f);
+        auto btn = CCMenuItemSpriteExtra::create(spr, hudHandler(), cb);
+        btn->setPosition({0.f, dir * 22.f * row});
+        menu->addChild(btn);
+        return spr;
+    };
+    g_hudToggle = add("ON", menu_selector(HudHandler::onToggle), 0);
+    g_hudWin = add("4 ticks", menu_selector(HudHandler::onWindow), 1);
+    g_hudWave = add("Grid", menu_selector(HudHandler::onWave), 2);
+
+    pl->addChild(menu, 1000);
+    refreshHud();
 }
 
 // ---- profiles --------------------------------------------------------
@@ -240,6 +393,7 @@ static constexpr ProfileKey PROFILE_KEYS[] = {
     {"ship-ticks", 'i'}, {"ufo-ticks", 'i'}, {"swing-ticks", 'i'}, {"wave-ticks", 'i'},
     {"dual-mode", 'b'},
     {"ship-style", 's'}, {"ufo-style", 's'}, {"swing-style", 's'},
+    {"inject-hold", 's'}, {"rering", 'b'}, {"coyote-ticks", 'i'},
 };
 
 static std::string serializeProfile() {
@@ -1483,11 +1637,25 @@ $on_mod(Loaded) {
     }
     listenForSettingChanges<bool>("debug", [](bool) { loadSettings(); });
     listenForSettingChanges<bool>("dual-mode", [](bool) { loadSettings(); });
+    listenForSettingChanges<bool>("enabled", [](bool) { loadSettings(); });
+    listenForSettingChanges<std::string>("inject-hold", [](std::string) { loadSettings(); });
+    listenForSettingChanges<bool>("rering", [](bool) { loadSettings(); });
+    listenForSettingChanges<int64_t>("coyote-ticks", [](int64_t) { loadSettings(); });
+    listenForSettingChanges<std::string>("legit-mode", [](std::string) { loadSettings(); });
+    listenForSettingChanges<bool>("feedback", [](bool) { loadSettings(); });
+    listenForSettingChanges<bool>("hud", [](bool) {
+        loadSettings();
+        if (auto pl = PlayLayer::get()) buildHud(pl);
+    });
+    listenForSettingChanges<std::string>("hud-pos", [](std::string) {
+        loadSettings();
+        if (auto pl = PlayLayer::get()) buildHud(pl);
+    });
     for (auto key : FLY_STYLE_KEYS) {
         listenForSettingChanges<std::string>(key, [](std::string) { loadSettings(); });
     }
 
-    log::info("[InputBuffer] BufferMod loaded (v22: profiles + keybinds). Main: {}, TPS: {}, wave: {}, dual: {}",
+    log::info("[InputBuffer] BufferMod loaded (v23: extras). Main: {}, TPS: {}, wave: {}, dual: {}",
               STAGE_NAMES[g_stage], g_tps, waveModeName(), g_dualEnabled ? "ON" : "OFF");
 }
 
@@ -1498,6 +1666,88 @@ $on_game(Loaded) {
         });
     }
 }
+
+// Shows how early your buffered clicks were and suggests a window for each mode.
+class StatsPopup : public geode::Popup {
+protected:
+    std::vector<CCNode*> m_nodes;
+
+    bool init() {
+        if (!Popup::init(360.f, 240.f)) return false;
+        this->setTitle("Click stats");
+        auto apply = ButtonSprite::create("Apply");
+        apply->setScale(0.6f);
+        m_buttonMenu->addChildAtPosition(
+            CCMenuItemSpriteExtra::create(apply, this, menu_selector(StatsPopup::onApply)),
+            Anchor::Center, {-60.f, -80.f});
+        auto clear = ButtonSprite::create("Clear");
+        clear->setScale(0.6f);
+        m_buttonMenu->addChildAtPosition(
+            CCMenuItemSpriteExtra::create(clear, this, menu_selector(StatsPopup::onClear)),
+            Anchor::Center, {60.f, -80.f});
+        this->build();
+        return true;
+    }
+
+    void line(std::string const& s, float y, float scale) {
+        auto label = CCLabelBMFont::create(s.c_str(), "bigFont.fnt");
+        label->setScale(scale);
+        m_mainLayer->addChildAtPosition(label, Anchor::Center, {0.f, y});
+        m_nodes.push_back(label);
+    }
+
+    void build() {
+        for (auto n : m_nodes) n->removeFromParent();
+        m_nodes.clear();
+        static constexpr char const* names[4] = {"Cube", "Ball", "Robot", "Spider"};
+        line("Play with clicks a bit early, then press Apply.", 78.f, 0.3f);
+        float y = 48.f;
+        for (int i = 0; i < 4; i++) {
+            float med = 0.f, p90 = 0.f;
+            int sug = 0;
+            char buf[160];
+            if (statsFor(i, med, p90, sug)) {
+                std::snprintf(buf, sizeof buf, "%s  n=%d  med %.1f  p90 %.1f  miss %d  -> %dt",
+                              names[i], static_cast<int>(g_samples[i].size()), med, p90, g_expired[i], sug);
+            } else {
+                std::snprintf(buf, sizeof buf, "%s  no buffered clicks yet  miss %d", names[i], g_expired[i]);
+            }
+            line(buf, y, 0.32f);
+            y -= 26.f;
+        }
+        line("Needs 5+ clicks per mode to apply. Times are in ticks.", -56.f, 0.28f);
+    }
+
+public:
+    static StatsPopup* create() {
+        auto ret = new StatsPopup();
+        if (ret->init()) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+
+    void onApply(CCObject*) {
+        int done = 0;
+        for (int i = 0; i < 4; i++) {
+            float med = 0.f, p90 = 0.f;
+            int sug = 0;
+            if (g_samples[i].size() >= 5 && statsFor(i, med, p90, sug)) {
+                Mod::get()->setSettingValue<int64_t>(MODE_KEYS[i], static_cast<int64_t>(sug));
+                done++;
+            }
+        }
+        std::string msg = done ? "Applied windows for " + std::to_string(done) + " mode(s)" : "Not enough clicks yet";
+        Notification::create(msg.c_str(), done ? NotificationIcon::Success : NotificationIcon::Warning, 1.5f)->show();
+    }
+
+    void onClear(CCObject*) {
+        clearStats();
+        this->build();
+    }
+};
 
 class $modify(BufferPause, PauseLayer) {
     void customSetup() {
@@ -1516,6 +1766,12 @@ class $modify(BufferPause, PauseLayer) {
         btn2->setPosition({0.f, 30.f});
         menu->addChild(btn2);
 
+        auto spr3 = ButtonSprite::create("Stats");
+        spr3->setScale(0.7f);
+        auto btn3 = CCMenuItemSpriteExtra::create(spr3, this, menu_selector(BufferPause::onBufferStats));
+        btn3->setPosition({0.f, 60.f});
+        menu->addChild(btn3);
+
         auto win = CCDirector::get()->getWinSize();
         menu->setPosition({win.width - 60.f, 30.f});
         this->addChild(menu);
@@ -1527,6 +1783,10 @@ class $modify(BufferPause, PauseLayer) {
 
     void onBufferProfiles(CCObject*) {
         if (auto popup = ProfilesPopup::create(currentLevelID())) popup->show();
+    }
+
+    void onBufferStats(CCObject*) {
+        if (auto popup = StatsPopup::create()) popup->show();
     }
 };
 
@@ -1570,6 +1830,7 @@ class $modify(BufferReset, PlayLayer) {
     // Leaving the level puts the player's own settings back.
     void onExit() {
         PlayLayer::onExit();
+        g_hudToggle = g_hudWin = g_hudWave = nullptr;
         g_secActive = false;
         g_secToken.clear();
         restoreAfterLevel();
@@ -1578,6 +1839,8 @@ class $modify(BufferReset, PlayLayer) {
     // Applies the profile linked to this level, if there is one.
     void setupHasCompleted() {
         PlayLayer::setupHasCompleted();
+        clearStats();
+        buildHud(this);
         if (!m_level) return;
         int id = levelKeyFor(m_level);
         if (id == 0) return;
@@ -1616,6 +1879,13 @@ struct PState {
 
     std::vector<std::pair<bool, int>> waveQueue;
     int lastReleaseStep = -1000000;
+
+    // v1.2 extras
+    int realPressStep = -1;      // step of the player's last real press
+    int lastHoldSteps = 1;       // how long the player's last real hold lasted
+    int releaseNextAt = 0;       // when the injected click lets go
+    int lastGroundStep = -1000000;
+    bool coyoteFire = false;     // a late click is waiting to be injected
 };
 
 class $modify(BufferLayer, GJBaseGameLayer) {
@@ -1697,9 +1967,32 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         s.waveQueue.clear();
     }
 
+    // How long an injected click is held: one step, or the length of the
+    // player's own last hold (so robot jump height and held orbs match).
+    int injectHoldSteps(PState& s) {
+        if (!g_injectMirror) return 1;
+        int cap = std::max(1, static_cast<int>(std::lround(INJECT_CAP_TICKS * stepsPerTick())));
+        return std::clamp(s.lastHoldSteps, 1, cap);
+    }
+
     void stepPlayer(PlayerObject* p, PState& s, int idx) {
         int step = m_fields->step;
         char const* tag = idx == 0 ? "P1" : "P2";
+
+        if (isGroundMode(p) && p->m_isOnGround) s.lastGroundStep = step;
+
+        // A click that came a few ticks after leaving the ground is injected
+        // as if the player were still standing on it (experimental).
+        if (s.coyoteFire) {
+            s.coyoteFire = false;
+            if (isGroundMode(p)) {
+                p->m_isOnGround = true;
+                sendInput(p, true);
+                s.releaseNext = true;
+                s.releaseNextAt = step + injectHoldSteps(s);
+                DBG("[InputBuffer] {} COYOTE press at step {} [{}]", tag, step, modeName(p));
+            }
+        }
 
         if (!s.waveQueue.empty()) {
             if (!isFlyMode(p)) {
@@ -1728,7 +2021,7 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             }
         }
 
-        if (s.releaseNext) {
+        if (s.releaseNext && step >= s.releaseNextAt) {
             s.releaseNext = false;
             if (!s.held) sendInput(p, false);
         }
@@ -1741,6 +2034,7 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         if (limit <= 0 || waited > limit || !isGroundMode(p)) {
             DBG("[InputBuffer] {} pending EXPIRED waited={} limit={} mode={}",
                 tag, waited, limit, modeName(p));
+            if (limit > 0 && waited > limit && isGroundMode(p)) recordExpired(modeIndex(p));
             s.pending = false;
             return;
         }
@@ -1761,11 +2055,24 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             char const* what = onRing ? "RING" : "GROUND";
 
             if (s.held) {
-                DBG("[InputBuffer] {} reached {} after {} steps but button still held, skipping ({})",
-                    tag, what, waited, modeName(p));
+                if (g_rering && onRing && !onGround) {
+                    // Still holding when the ring was reached: let go and press
+                    // again so the ring gets a fresh click.
+                    sendInput(p, false);
+                    sendInput(p, true);
+                    DBG("[InputBuffer] {} RING re-press after {} steps ({})", tag, waited, modeName(p));
+                    recordSample(modeIndex(p), ticksSaved);
+                    showFeedback(ticksSaved);
+                } else {
+                    DBG("[InputBuffer] {} reached {} after {} steps but button still held, skipping ({})",
+                        tag, what, waited, modeName(p));
+                }
             } else {
                 sendInput(p, true);
                 s.releaseNext = true;
+                s.releaseNextAt = step + injectHoldSteps(s);
+                recordSample(modeIndex(p), ticksSaved);
+                showFeedback(ticksSaved);
                 log::info("[InputBuffer] *** SAVED +{:.1f} TICKS ({:.2f} frames @ 60fps) PRESS! [{} {} {}] (Step0: {} -> Delayed: {}) [Limit: {} steps] ***",
                           ticksSaved, ticksSaved / 4.0f, tag, modeName(p), what,
                           s.pendingStart, step, limit);
@@ -1776,6 +2083,10 @@ class $modify(BufferLayer, GJBaseGameLayer) {
     bool inputPlayer(PlayerObject* p, PState& s, int idx, bool down) {
         int step = m_fields->step;
         char const* tag = idx == 0 ? "P1" : "P2";
+
+        // Remember how long the player really holds, for Mirror hold.
+        if (down) s.realPressStep = step;
+        else if (s.realPressStep >= 0) s.lastHoldSteps = std::max(1, step - s.realPressStep);
 
         if (!isFlyMode(p) && !s.waveQueue.empty()) {
             flushWaveQueue(p, s, idx);
@@ -1843,6 +2154,21 @@ class $modify(BufferLayer, GJBaseGameLayer) {
             }
         }
 
+        // Late click (coyote time): a press a few ticks after walking off an
+        // edge still counts. Not while rising, and not while on a ring.
+        if (down && g_coyote > 0 && isGroundMode(p) && !p->m_isOnGround && ringsTouching(p) == 0) {
+            int cs = std::max(1, static_cast<int>(std::lround(g_coyote * stepsPerTick())));
+            double vy = p->m_isUpsideDown ? -p->m_yVelocity : p->m_yVelocity;
+            if (vy <= 0.0 && step - s.lastGroundStep <= cs) {
+                s.held = true;
+                s.pending = false;
+                s.coyoteFire = true;
+                DBG("[InputBuffer] {} late click accepted {} steps after ground [{}]",
+                    tag, step - s.lastGroundStep, modeName(p));
+                return true;
+            }
+        }
+
         s.held = down;
 
         if (down) {
@@ -1873,7 +2199,7 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         }
 
         // Experimental dual support is off: plain game input in dual sections.
-        if (sharedDualInput() && !g_dualEnabled) {
+        if ((sharedDualInput() && !g_dualEnabled) || !assistAllowed()) {
             bypassCleanup();
             return;
         }
@@ -1885,6 +2211,15 @@ class $modify(BufferLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
         auto f = m_fields.operator->();
         syncState();
+
+        // Switched off, or legit mode: plain game input.
+        if (PlayLayer::get() && button == 1 && !assistAllowed()) {
+            bypassCleanup();
+            f->ps[0].held = down;
+            f->ps[1].held = down;
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            return;
+        }
 
         if (PlayLayer::get() && button == 1) {
             // Outside two-player mode the game applies every input to player 1,
