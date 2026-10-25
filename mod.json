@@ -5,7 +5,7 @@
     },
     "id": "lyophi.buffermod",
     "name": "Input Buffer",
-    "version": "v1.3.0",
+    "version": "v1.6.0",
     "developer": "Lyophi",
     "description": "Predictive input buffering for Geometry Dash. Early clicks are remembered and fired when you land or touch an orb, and ship, UFO, swing and wave get smoother, more consistent timing.",
     "settings": {
@@ -254,15 +254,24 @@
             "description": "Shows a small +N.Nt at the top of the screen each time the mod fires a buffered click, with how many ticks early you were.",
             "default": true
         },
+        "robot-minhold": {
+            "type": "int",
+            "name": "Robot Minimum Hold (ticks)",
+            "description": "In robot, a very quick tap on the ground is held for at least this long before the release goes out, so the jump is not cut short. A new press lets go first, so click order is kept. **0** = off.",
+            "default": 0,
+            "min": 0,
+            "max": 32,
+            "control": { "input": true, "arrows": true, "slider": false }
+        },
         "sec-smart": {
             "type": "title",
-            "name": "Smart Jump (cube)",
-            "description": "Looks at the spikes and saws ahead. If your ground click would hit one but a slightly later jump would clear it, the click is held back and fired at the safe tick. It learns your jump from your own jumps, so jump once on flat ground first. Spikes and saws only: solid blocks, orbs and pads are not predicted."
+            "name": "Smart Jump (cube and robot)",
+            "description": "Looks at the spikes and saws ahead. If your ground click would hit one but a slightly later jump would clear it, the click is held back and fired at the safe tick. It learns your jump from your own jumps, so jump once on flat ground first. For the robot, jump once the way you usually hold it: the mod repeats that jump height and hold. Spikes and saws only: solid blocks, orbs and pads are not predicted."
         },
         "smart-jump": {
             "type": "bool",
             "name": "Smart Jump (Experimental)",
-            "description": "Turns Smart Jump on. Cube only. Off by default.",
+            "description": "Turns Smart Jump on. Cube and robot. Off by default.",
             "default": false
         },
         "smart-window": {
@@ -289,6 +298,21 @@
             "description": "**Middle**: the middle of the safe timings, the most forgiving.\n**Earliest**: the first safe tick.",
             "default": "Middle",
             "one-of": ["Middle", "Earliest"]
+        },
+        "smart-wave": {
+            "type": "bool",
+            "name": "Smart Wave (Experimental)",
+            "description": "In wave, if turning right now would fly into a spike or saw but turning a few ticks later would not, your click or release is held back and fired at the safe tick. It watches spikes and saws only (not block corridors or slopes) and assumes the wave keeps its new direction for a short while. Off by default.",
+            "default": false
+        },
+        "smart-wave-window": {
+            "type": "int",
+            "name": "Smart Wave Look-ahead (ticks)",
+            "description": "How many ticks later than your input a wave turn may be fired.",
+            "default": 4,
+            "min": 1,
+            "max": 16,
+            "control": { "input": true, "arrows": true, "slider": false }
         },
         "sec-general": {
             "type": "title",
