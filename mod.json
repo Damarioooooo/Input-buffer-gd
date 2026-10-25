@@ -5,7 +5,7 @@
     },
     "id": "lyophi.buffermod",
     "name": "Input Buffer",
-    "version": "v1.1.0",
+    "version": "v1.2.0",
     "developer": "Lyophi",
     "description": "Predictive input buffering for Geometry Dash. Early clicks are remembered and fired when you land or touch an orb, and ship, UFO, swing and wave get smoother, more consistent timing.",
     "settings": {
@@ -194,6 +194,65 @@
             "name": "Level Sections (Experimental)",
             "description": "Lets a level use different settings between percents you choose (for example 0.00-35.00% one setup, 35.50-60.00% another). Each section has its own start, end and settings. Edit them from the pause menu: **Buffer > Advanced > Sections**.\n\nOff by default. Sections do not work in platformer levels. Switching sections clears held input at the boundary.",
             "default": false
+        },
+        "sec-extras": {
+            "type": "title",
+            "name": "Extras",
+            "description": "On/off switch, click shaping, legit mode and the on-screen buttons."
+        },
+        "enabled": {
+            "type": "bool",
+            "name": "Buffer Enabled",
+            "description": "Master switch. Off = plain game input everywhere. The ON/OFF on-screen button flips this.",
+            "default": true
+        },
+        "inject-hold": {
+            "type": "string",
+            "name": "Injected Click Hold",
+            "description": "How long the click the mod fires for you is held.\n\n**Short** (default): one step, the same as before.\n**Mirror my hold**: held as long as you actually held your early click (up to 30 ticks). Keeps robot jump height and held orbs the way you pressed them.",
+            "default": "Short",
+            "one-of": ["Short", "Mirror my hold"]
+        },
+        "rering": {
+            "type": "bool",
+            "name": "Re-press On Rings (Experimental)",
+            "description": "If you are still holding your early click when you reach an orb, the mod lets go and presses again so the orb gets a fresh click. Off by default.",
+            "default": false
+        },
+        "coyote-ticks": {
+            "type": "int",
+            "name": "Late Click Window (ticks, Experimental)",
+            "description": "A click up to this many ticks after you leave the ground still counts as a jump. Works while falling only, not on rings. **0** = off.",
+            "default": 0,
+            "min": 0,
+            "max": 16,
+            "control": { "input": true, "arrows": true, "slider": false }
+        },
+        "legit-mode": {
+            "type": "string",
+            "name": "Legit Mode",
+            "description": "Turns the assist off by itself in normal (non-practice) runs.\n\n**Off**: assist always on.\n**Rated levels**: no assist in normal runs of rated levels.\n**All levels**: no assist in any normal run.\n\nPractice mode and test mode always keep the assist. This is a safety net, not a guarantee.",
+            "default": "Off",
+            "one-of": ["Off", "Rated levels", "All levels"]
+        },
+        "hud": {
+            "type": "bool",
+            "name": "On-Screen Buttons",
+            "description": "Shows three small buttons in a corner of the level: on/off, buffer window and wave mode. Off by default because a button in the way can eat a tap. Pick a corner you never touch.",
+            "default": false
+        },
+        "hud-pos": {
+            "type": "string",
+            "name": "On-Screen Buttons Corner",
+            "description": "Which corner the on-screen buttons sit in.",
+            "default": "Top Right",
+            "one-of": ["Top Left", "Top Right", "Bottom Left", "Bottom Right"]
+        },
+        "feedback": {
+            "type": "bool",
+            "name": "Click Feedback",
+            "description": "Shows a small +N.Nt at the top of the screen each time the mod fires a buffered click, with how many ticks early you were.",
+            "default": true
         },
         "sec-general": {
             "type": "title",
