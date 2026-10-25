@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -79,6 +80,17 @@ static bool g_feedback = true;
 static constexpr int INJECT_CAP_TICKS = 30;
 static void refreshHud();
 
+// Smart Jump (cube): learns a real jump, then delays an early ground click to
+// a start tick that clears the hazards ahead.
+static bool g_smart = false;
+static int g_smartWindow = 12;     // ticks to look ahead
+static int g_smartMargin = 0;      // extra safety around hazards, in units
+static bool g_smartEarliest = false;
+static int g_sjLat = 0;            // steps between our click and the icon lifting off
+static float g_vx = 0.f;           // measured horizontal units per step
+static constexpr char const* INJECT_NAMES[] = {"Short", "Mirror my hold"};
+static constexpr char const* SMART_PICK_NAMES[] = {"Middle", "Earliest"};
+
 // Hotkeys are keybind settings. Order: 0 stage, 1 tps up, 2 tps down, 3 debug, 4 wave mode, 5 add section.
 static constexpr int KEYBIND_COUNT = 6;
 static constexpr char const* KEYBIND_SETTINGS[] = {"kb-stage", "kb-tps-up", "kb-tps-down", "kb-debug", "kb-wave", "kb-section"};
@@ -115,6 +127,10 @@ static void loadSettings() {
     g_hud = m->getSettingValue<bool>("hud");
     g_hudPos = indexOf(HUD_POS_NAMES, 4, m->getSettingValue<std::string>("hud-pos"), 1);
     g_feedback = m->getSettingValue<bool>("feedback");
+    g_smart = m->getSettingValue<bool>("smart-jump");
+    g_smartWindow = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("smart-window")), 1, 40);
+    g_smartMargin = std::clamp(static_cast<int>(m->getSettingValue<int64_t>("smart-margin")), 0, 6);
+    g_smartEarliest = m->getSettingValue<std::string>("smart-pick") == "Earliest";
     refreshHud();
 }
 
@@ -302,14 +318,12 @@ static bool statsFor(int i, float& med, float& p90, int& suggest) {
 
 // A small "+3.2t" that fades out at the top of the screen when a buffered
 // click fires.
-static void showFeedback(float ticks) {
+static void showText(char const* text) {
     if (!g_feedback) return;
     auto pl = PlayLayer::get();
     if (!pl) return;
     auto win = CCDirector::get()->getWinSize();
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "+%.1ft", ticks);
-    auto label = CCLabelBMFont::create(buf, "bigFont.fnt");
+    auto label = CCLabelBMFont::create(text, "bigFont.fnt");
     label->setScale(0.4f);
     label->setColor({90, 255, 120});
     label->setPosition({win.width / 2.f, win.height - 30.f});
@@ -319,6 +333,12 @@ static void showFeedback(float ticks) {
         CCFadeOut::create(0.35f),
         CCCallFunc::create(label, callfunc_selector(CCNode::removeFromParent)),
         nullptr));
+}
+
+static void showFeedback(float ticks) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "+%.1ft", ticks);
+    showText(buf);
 }
 
 static ButtonSprite* g_hudToggle = nullptr;
@@ -394,6 +414,7 @@ static constexpr ProfileKey PROFILE_KEYS[] = {
     {"dual-mode", 'b'},
     {"ship-style", 's'}, {"ufo-style", 's'}, {"swing-style", 's'},
     {"inject-hold", 's'}, {"rering", 'b'}, {"coyote-ticks", 'i'},
+    {"smart-jump", 'b'}, {"smart-window", 'i'}, {"smart-margin", 'i'}, {"smart-pick", 's'},
 };
 
 static std::string serializeProfile() {
@@ -1643,6 +1664,10 @@ $on_mod(Loaded) {
     listenForSettingChanges<int64_t>("coyote-ticks", [](int64_t) { loadSettings(); });
     listenForSettingChanges<std::string>("legit-mode", [](std::string) { loadSettings(); });
     listenForSettingChanges<bool>("feedback", [](bool) { loadSettings(); });
+    listenForSettingChanges<bool>("smart-jump", [](bool) { loadSettings(); });
+    listenForSettingChanges<int64_t>("smart-window", [](int64_t) { loadSettings(); });
+    listenForSettingChanges<int64_t>("smart-margin", [](int64_t) { loadSettings(); });
+    listenForSettingChanges<std::string>("smart-pick", [](std::string) { loadSettings(); });
     listenForSettingChanges<bool>("hud", [](bool) {
         loadSettings();
         if (auto pl = PlayLayer::get()) buildHud(pl);
@@ -1655,7 +1680,7 @@ $on_mod(Loaded) {
         listenForSettingChanges<std::string>(key, [](std::string) { loadSettings(); });
     }
 
-    log::info("[InputBuffer] BufferMod loaded (v23: extras). Main: {}, TPS: {}, wave: {}, dual: {}",
+    log::info("[InputBuffer] BufferMod loaded (v24: smart jump + panel). Main: {}, TPS: {}, wave: {}, dual: {}",
               STAGE_NAMES[g_stage], g_tps, waveModeName(), g_dualEnabled ? "ON" : "OFF");
 }
 
@@ -1666,6 +1691,92 @@ $on_game(Loaded) {
         });
     }
 }
+
+// ---- Smart Jump data -----------------------------------------------------
+struct Hz { float minx, maxx, miny, maxy; bool circle; float cx, cy, r; };
+static std::vector<Hz> g_haz;      // hazards of the current level, sorted by minx
+static bool g_hazBuilt = false;
+static std::map<std::string, std::vector<float>> g_tmpl; // jump shapes by icon size / gravity / TPS
+
+static std::string smartKey(PlayerObject* p) {
+    std::string k = "sj-" + std::to_string(static_cast<int>(std::lround(p->getScale() * 100.f)));
+    k += p->m_isUpsideDown ? "-u-" : "-d-";
+    k += std::to_string(g_tps);
+    return k;
+}
+
+static std::vector<float> const* smartTemplate(std::string const& key) {
+    auto it = g_tmpl.find(key);
+    if (it != g_tmpl.end()) return &it->second;
+    std::string raw = Mod::get()->getSavedValue<std::string>("tmpl-" + key, "");
+    if (raw.empty()) return nullptr;
+    std::vector<float> v;
+    for (auto const& part : splitStr(raw, ',')) {
+        if (!part.empty()) v.push_back(static_cast<float>(std::atof(part.c_str())));
+    }
+    if (v.size() < 8) return nullptr;
+    g_tmpl[key] = std::move(v);
+    return &g_tmpl[key];
+}
+
+static void smartStore(std::string const& key, std::vector<float> v) {
+    std::string raw;
+    char buf[32];
+    for (float f : v) {
+        std::snprintf(buf, sizeof buf, "%.4f,", f);
+        raw += buf;
+    }
+    Mod::get()->setSavedValue<std::string>("tmpl-" + key, raw);
+    g_tmpl[key] = std::move(v);
+}
+
+// ---- tabbed settings panel -----------------------------------------------
+// kinds: c = choice, i = number (-1 shows "Main", 0 shows "Off"), n = plain number,
+//        b = on/off, t = TPS presets, p = quick preset
+struct PRow { char const* label; char const* key; char kind; int lo; int hi; char const* const* names; int n; };
+
+static constexpr PRow ROWS_BUFFER[] = {
+    {"Quick preset", nullptr, 'p', 0, 0, nullptr, 0},
+    {"Main window", "stage", 'c', 0, 0, STAGE_NAMES, STAGE_COUNT},
+    {"Game speed (TPS)", "tps-value", 't', 0, 0, nullptr, 0},
+    {"Cube window", "cube-ticks", 'i', -1, 64, nullptr, 0},
+    {"Ball window", "ball-ticks", 'i', -1, 64, nullptr, 0},
+    {"Robot window", "robot-ticks", 'i', -1, 64, nullptr, 0},
+    {"Spider window", "spider-ticks", 'i', -1, 64, nullptr, 0},
+};
+static constexpr PRow ROWS_FLY[] = {
+    {"Ship window", "ship-ticks", 'i', -1, 64, nullptr, 0},
+    {"UFO window", "ufo-ticks", 'i', -1, 64, nullptr, 0},
+    {"Swing window", "swing-ticks", 'i', -1, 64, nullptr, 0},
+    {"Wave window", "wave-ticks", 'i', -1, 64, nullptr, 0},
+    {"Wave mode", "wave-mode", 'c', 0, 0, WAVE_NAMES, WAVE_MODE_COUNT},
+    {"Ship style", "ship-style", 'c', 0, 0, WAVE_NAMES, WAVE_MODE_COUNT},
+    {"UFO style", "ufo-style", 'c', 0, 0, WAVE_NAMES, WAVE_MODE_COUNT},
+    {"Swing style", "swing-style", 'c', 0, 0, WAVE_NAMES, WAVE_MODE_COUNT},
+};
+static constexpr PRow ROWS_SMART[] = {
+    {"Smart Jump", "smart-jump", 'b', 0, 0, nullptr, 0},
+    {"Look-ahead (ticks)", "smart-window", 'n', 1, 40, nullptr, 0},
+    {"Safety margin", "smart-margin", 'n', 0, 6, nullptr, 0},
+    {"Pick timing", "smart-pick", 'c', 0, 0, SMART_PICK_NAMES, 2},
+};
+static constexpr PRow ROWS_EXTRAS[] = {
+    {"Buffer on/off", "enabled", 'b', 0, 0, nullptr, 0},
+    {"Injected hold", "inject-hold", 'c', 0, 0, INJECT_NAMES, 2},
+    {"Ring re-press", "rering", 'b', 0, 0, nullptr, 0},
+    {"Late click (ticks)", "coyote-ticks", 'i', 0, 16, nullptr, 0},
+    {"Legit mode", "legit-mode", 'c', 0, 0, LEGIT_NAMES, 3},
+    {"Click feedback", "feedback", 'b', 0, 0, nullptr, 0},
+    {"On-screen buttons", "hud", 'b', 0, 0, nullptr, 0},
+    {"Buttons corner", "hud-pos", 'c', 0, 0, HUD_POS_NAMES, 4},
+};
+static constexpr PRow ROWS_TOOLS[] = {
+    {"Dual mode (exp.)", "dual-mode", 'b', 0, 0, nullptr, 0},
+    {"Level sections (exp.)", "sections", 'b', 0, 0, nullptr, 0},
+    {"Debug logging", "debug", 'b', 0, 0, nullptr, 0},
+};
+static constexpr char const* EXTRA_DEFAULTS =
+    "inject-hold=Short|rering=0|coyote-ticks=0|smart-jump=0|smart-window=12|smart-margin=0|smart-pick=Middle";
 
 // Shows how early your buffered clicks were and suggests a window for each mode.
 class StatsPopup : public geode::Popup {
@@ -1749,6 +1860,198 @@ public:
     }
 };
 
+// One window for every setting, split into tabs.
+class PanelPopup : public geode::Popup {
+protected:
+    static constexpr char const* TAB_NAMES[5] = {"Buffer", "Fly", "Smart", "Extras", "Tools"};
+    int m_tab = 0;
+    int m_levelID = 0;
+    std::vector<CCNode*> m_nodes;
+    std::vector<CCLabelBMFont*> m_values;
+    PRow const* m_rows = nullptr;
+    int m_rowCount = 0;
+    CCLabelBMFont* m_note = nullptr;
+
+    bool init(int levelID) {
+        if (!Popup::init(380.f, 290.f)) return false;
+        m_levelID = levelID;
+        this->setTitle("Input Buffer");
+        for (int i = 0; i < 5; i++) {
+            auto spr = ButtonSprite::create(TAB_NAMES[i]);
+            spr->setScale(0.5f);
+            auto btn = CCMenuItemSpriteExtra::create(spr, this, menu_selector(PanelPopup::onTab));
+            btn->setTag(i);
+            m_buttonMenu->addChildAtPosition(btn, Anchor::Center, {-150.f + i * 75.f, 100.f});
+        }
+        m_note = CCLabelBMFont::create("", "bigFont.fnt");
+        m_note->setScale(0.3f);
+        m_mainLayer->addChildAtPosition(m_note, Anchor::Center, {0.f, -122.f});
+        this->build();
+        return true;
+    }
+
+    void addButton(char const* s, float x, float y, SEL_MenuHandler cb) {
+        auto spr = ButtonSprite::create(s);
+        spr->setScale(0.55f);
+        auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
+        m_buttonMenu->addChildAtPosition(btn, Anchor::Center, {x, y});
+        m_nodes.push_back(btn);
+    }
+
+    void build() {
+        for (auto n : m_nodes) n->removeFromParent();
+        m_nodes.clear();
+        m_values.clear();
+        m_note->setString("");
+        m_rows = nullptr;
+        m_rowCount = 0;
+        switch (m_tab) {
+            case 0: m_rows = ROWS_BUFFER; m_rowCount = static_cast<int>(std::size(ROWS_BUFFER)); break;
+            case 1: m_rows = ROWS_FLY; m_rowCount = static_cast<int>(std::size(ROWS_FLY)); break;
+            case 2: m_rows = ROWS_SMART; m_rowCount = static_cast<int>(std::size(ROWS_SMART)); break;
+            case 3: m_rows = ROWS_EXTRAS; m_rowCount = static_cast<int>(std::size(ROWS_EXTRAS)); break;
+            default: m_rows = ROWS_TOOLS; m_rowCount = static_cast<int>(std::size(ROWS_TOOLS)); break;
+        }
+
+        float y = 66.f;
+        for (int i = 0; i < m_rowCount; i++, y -= 22.f) {
+            auto label = CCLabelBMFont::create(m_rows[i].label, "bigFont.fnt");
+            label->setScale(0.36f);
+            label->setAnchorPoint({0.f, 0.5f});
+            m_mainLayer->addChildAtPosition(label, Anchor::Center, {-172.f, y});
+            m_nodes.push_back(label);
+
+            auto value = CCLabelBMFont::create("", "bigFont.fnt");
+            value->setScale(0.4f);
+            m_mainLayer->addChildAtPosition(value, Anchor::Center, {95.f, y});
+            m_nodes.push_back(value);
+            m_values.push_back(value);
+
+            for (int side = 0; side < 2; side++) {
+                auto arrow = CCSprite::createWithSpriteFrameName("GJ_arrow_01_001.png");
+                arrow->setScale(0.45f);
+                arrow->setFlipX(side == 1);
+                auto btn = CCMenuItemSpriteExtra::create(arrow, this, menu_selector(PanelPopup::onStep));
+                btn->setTag(i * 2 + side);
+                m_buttonMenu->addChildAtPosition(btn, Anchor::Center, {side == 0 ? 35.f : 155.f, y});
+                m_nodes.push_back(btn);
+            }
+        }
+
+        if (m_tab == 2) {
+            std::string st = "Learns your jump from your own jumps. Cube only.";
+            if (auto pl = PlayLayer::get(); pl && pl->m_player1) {
+                st = smartTemplate(smartKey(pl->m_player1))
+                    ? "Calibrated for this icon size and gravity."
+                    : "Not calibrated yet: jump once on flat ground.";
+            }
+            m_note->setString(st.c_str());
+        } else if (m_tab == 4) {
+            addButton("Profiles", -75.f, -10.f, menu_selector(PanelPopup::onProfiles));
+            addButton("Sections", 75.f, -10.f, menu_selector(PanelPopup::onSections));
+            addButton("Stats", -75.f, -38.f, menu_selector(PanelPopup::onStats));
+            addButton("Reset all", 75.f, -38.f, menu_selector(PanelPopup::onReset));
+            addButton("Geode settings", 0.f, -66.f, menu_selector(PanelPopup::onGeode));
+        }
+        this->refreshValues();
+    }
+
+    std::string valueText(PRow const& r) {
+        auto m = Mod::get();
+        switch (r.kind) {
+            case 'c': return m->getSettingValue<std::string>(r.key);
+            case 'b': return m->getSettingValue<bool>(r.key) ? "On" : "Off";
+            case 't': return std::to_string(g_tps);
+            case 'p': {
+                int p = currentPreset();
+                return p >= 0 ? PRESET_NAMES[p] : "Custom";
+            }
+            case 'n': return std::to_string(m->getSettingValue<int64_t>(r.key));
+            default: {
+                int64_t v = m->getSettingValue<int64_t>(r.key);
+                if (v == -1) return "Main";
+                if (v == 0) return "Off";
+                return std::to_string(v);
+            }
+        }
+    }
+
+    void refreshValues() {
+        for (int i = 0; i < m_rowCount && i < static_cast<int>(m_values.size()); i++) {
+            m_values[i]->setString(valueText(m_rows[i]).c_str());
+        }
+    }
+
+public:
+    static PanelPopup* create(int levelID) {
+        auto ret = new PanelPopup();
+        if (ret->init(levelID)) {
+            ret->autorelease();
+            return ret;
+        }
+        delete ret;
+        return nullptr;
+    }
+
+    void onTab(CCObject* sender) {
+        m_tab = static_cast<CCNode*>(sender)->getTag();
+        this->build();
+    }
+
+    void onStep(CCObject* sender) {
+        int tag = static_cast<CCNode*>(sender)->getTag();
+        int i = tag / 2;
+        int dir = (tag % 2) ? 1 : -1;
+        if (i < 0 || i >= m_rowCount) return;
+        auto const& r = m_rows[i];
+        auto m = Mod::get();
+        switch (r.kind) {
+            case 'c': {
+                int cur = indexOf(r.names, r.n, m->getSettingValue<std::string>(r.key), 0);
+                cur = (cur + dir + r.n) % r.n;
+                m->setSettingValue<std::string>(r.key, r.names[cur]);
+                break;
+            }
+            case 'b':
+                m->setSettingValue<bool>(r.key, !m->getSettingValue<bool>(r.key));
+                break;
+            case 't':
+                m->setSettingValue<int64_t>(r.key, static_cast<int64_t>(stepTps(g_tps, dir > 0)));
+                break;
+            case 'p': {
+                int p = currentPreset();
+                int next = p < 0 ? 2 : (p + dir + PRESET_COUNT) % PRESET_COUNT;
+                m->setSettingValue<std::string>("stage", PRESET_STAGE[next]);
+                for (auto k : MODE_KEYS) m->setSettingValue<int64_t>(k, -1);
+                break;
+            }
+            default: {
+                int64_t v = m->getSettingValue<int64_t>(r.key) + dir;
+                v = std::clamp<int64_t>(v, r.lo, r.hi);
+                m->setSettingValue<int64_t>(r.key, v);
+                break;
+            }
+        }
+        loadSettings();
+        if (r.key && (std::string(r.key) == "hud" || std::string(r.key) == "hud-pos")) {
+            if (auto pl = PlayLayer::get()) buildHud(pl);
+        }
+        this->refreshValues();
+    }
+
+    void onProfiles(CCObject*) { if (auto p = ProfilesPopup::create(m_levelID)) p->show(); }
+    void onSections(CCObject*) { openSectionsWindow(m_levelID); }
+    void onStats(CCObject*) { if (auto p = StatsPopup::create()) p->show(); }
+    void onGeode(CCObject*) { openSettingsPopup(Mod::get(), false); }
+
+    void onReset(CCObject*) {
+        applyProfileData(DEFAULT_PROFILE);
+        applyProfileData(EXTRA_DEFAULTS);
+        this->build();
+        m_note->setString("Settings reset to defaults.");
+    }
+};
+
 class $modify(BufferPause, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
@@ -1778,7 +2081,7 @@ class $modify(BufferPause, PauseLayer) {
     }
 
     void onBufferSettings(CCObject*) {
-        if (auto popup = BufferPopup::create(currentLevelID())) popup->show();
+        if (auto popup = PanelPopup::create(currentLevelID())) popup->show();
     }
 
     void onBufferProfiles(CCObject*) {
@@ -1840,6 +2143,7 @@ class $modify(BufferReset, PlayLayer) {
     void setupHasCompleted() {
         PlayLayer::setupHasCompleted();
         clearStats();
+        g_hazBuilt = false;
         buildHud(this);
         if (!m_level) return;
         int id = levelKeyFor(m_level);
@@ -1886,6 +2190,18 @@ struct PState {
     int releaseNextAt = 0;       // when the injected click lets go
     int lastGroundStep = -1000000;
     bool coyoteFire = false;     // a late click is waiting to be injected
+
+    // Smart Jump
+    bool haveLast = false;
+    int lastStep = -1;
+    float lastX = 0.f, lastY = 0.f;
+    bool wasGround = false;
+    bool jrec = false;           // recording a real jump
+    float jy0 = 0.f, jsgn = 1.f, jd2 = 0.f;
+    std::vector<float> jT;
+    bool smartFire = false;      // a delayed click is on its way
+    int smartFireAt = 0;
+    int sjFireStep = -1;         // when we last fired, to measure liftoff latency
 };
 
 class $modify(BufferLayer, GJBaseGameLayer) {
@@ -1975,11 +2291,202 @@ class $modify(BufferLayer, GJBaseGameLayer) {
         return std::clamp(s.lastHoldSteps, 1, cap);
     }
 
+    // Watches the cube to measure its speed and to learn the shape of a real
+    // jump (height per step) from the player's own jumps.
+    void smartObserve(PlayerObject* p, PState& s, int step) {
+        if (!g_smart || modeIndex(p) != 0 || sharedDualInput()) {
+            s.haveLast = false;
+            s.jrec = false;
+            return;
+        }
+        auto pos = p->getPosition();
+        float x = pos.x, y = pos.y;
+        bool ground = p->m_isOnGround;
+        float sgn = p->m_isUpsideDown ? -1.f : 1.f;
+
+        if (s.haveLast && step == s.lastStep + 1) {
+            float dx = x - s.lastX;
+            if (dx > 0.01f) g_vx = dx;
+        }
+
+        if (s.jrec) {
+            bool bad = sgn != s.jsgn || ringsTouching(p) > 0 || s.jT.size() > 600;
+            if (bad) {
+                s.jrec = false;
+            } else if (ground) {
+                if (s.jT.size() >= 8 && std::fabs((y - s.jy0) * sgn) < 1.5f) {
+                    smartStore(smartKey(p), s.jT);
+                    log::info("[InputBuffer] smart jump: learned a jump of {} steps ({})", s.jT.size(), smartKey(p));
+                }
+                s.jrec = false;
+            } else {
+                float dy = (y - s.jy0) * sgn;
+                size_t n = s.jT.size();
+                if (n >= 3) {
+                    float d2 = dy - 2.f * s.jT[n - 1] + s.jT[n - 2];
+                    if (n == 3) s.jd2 = d2;
+                    else if (std::fabs(d2 - s.jd2) > std::max(0.0005f, 0.5f * std::fabs(s.jd2))) s.jrec = false;
+                }
+                if (s.jrec) s.jT.push_back(dy);
+            }
+        } else if (s.haveLast && s.wasGround && !ground && step == s.lastStep + 1 &&
+                   (y - s.lastY) * sgn > 0.2f &&
+                   (step - s.realPressStep <= 4 || s.sjFireStep >= 0)) {
+            s.jrec = true;
+            s.jy0 = s.lastY;
+            s.jsgn = sgn;
+            s.jd2 = 0.f;
+            s.jT.clear();
+            s.jT.push_back((y - s.lastY) * sgn);
+            if (s.sjFireStep >= 0) {
+                g_sjLat = std::clamp(step - 1 - s.sjFireStep, 0, 3);
+                s.sjFireStep = -1;
+            }
+        }
+
+        s.wasGround = ground;
+        s.lastX = x;
+        s.lastY = y;
+        s.lastStep = step;
+        s.haveLast = true;
+    }
+
+    // Collects the deadly objects of the level once.
+    void ensureHazards() {
+        if (g_hazBuilt) return;
+        g_hazBuilt = true;
+        g_haz.clear();
+        if (!m_objects) return;
+        for (auto obj : CCArrayExt<GameObject*>(m_objects)) {
+            if (!obj || obj->m_objectType != GameObjectType::Hazard || obj->m_isNoTouch) continue;
+            Hz h{};
+            auto c = obj->getPosition();
+            if (obj->m_objectRadius > 0.f) {
+                h.circle = true;
+                h.cx = c.x;
+                h.cy = c.y;
+                h.r = obj->m_objectRadius;
+                h.minx = c.x - h.r;
+                h.maxx = c.x + h.r;
+                h.miny = c.y - h.r;
+                h.maxy = c.y + h.r;
+            } else {
+                auto r = obj->getObjectRect();
+                if (r.size.width < 0.5f || r.size.height < 0.5f) r = CCRect(c.x - 6.f, c.y - 6.f, 12.f, 12.f);
+                h.minx = r.getMinX();
+                h.maxx = r.getMaxX();
+                h.miny = r.getMinY();
+                h.maxy = r.getMaxY();
+            }
+            g_haz.push_back(h);
+        }
+        std::sort(g_haz.begin(), g_haz.end(), [](Hz const& a, Hz const& b) { return a.minx < b.minx; });
+        log::info("[InputBuffer] smart jump: cached {} hazards", g_haz.size());
+    }
+
+    // Returns how many steps to wait before firing the click, or -1 to let the
+    // click go through untouched.
+    int smartDecide(PlayerObject* p, PState& s, int step) {
+        if (!g_smart || modeIndex(p) != 0 || !p->m_isOnGround || sharedDualInput()) return -1;
+        if (g_vx <= 0.05f) return -1;
+        std::string key = smartKey(p);
+        auto tm = smartTemplate(key);
+        if (!tm) {
+            DBG("[InputBuffer] smart jump: not calibrated for {} (jump once first)", key);
+            return -1;
+        }
+        ensureHazards();
+        if (g_haz.empty()) return -1;
+
+        auto pos = p->getPosition();
+        float x0 = pos.x, y0 = pos.y;
+        CCRect pr = p->getObjectRect();
+        float pw = pr.size.width, ph = pr.size.height;
+        float offx = pr.getMidX() - pos.x, offy = pr.getMidY() - pos.y;
+        if (pw < 2.f || ph < 2.f) {
+            pw = ph = 30.f * p->getScale();
+            offx = offy = 0.f;
+        }
+        float sgn = p->m_isUpsideDown ? -1.f : 1.f;
+        int N = static_cast<int>(tm->size());
+        int W = std::max(1, static_cast<int>(std::lround(g_smartWindow * stepsPerTick())));
+        int lat = g_sjLat;
+        float margin = static_cast<float>(g_smartMargin);
+        float vx = g_vx;
+        int total = 1 + W + lat + N + 2;
+
+        float xmax = x0 + vx * total + pw + 40.f;
+        std::vector<Hz const*> nearby;
+        auto it = std::lower_bound(g_haz.begin(), g_haz.end(), x0 - 300.f,
+                                   [](Hz const& h, float v) { return h.minx < v; });
+        for (; it != g_haz.end() && it->minx <= xmax; ++it) nearby.push_back(&*it);
+        if (nearby.empty()) return -1;
+
+        // Would starting the jump d steps from now survive?
+        auto survives = [&](int d) {
+            int O = 1 + d + lat;            // step the icon lifts off
+            int last = O + N + 1;
+            for (int m = 1; m <= last; m++) {
+                float cx = x0 + vx * m + offx;
+                float dy = 0.f;
+                if (m > O) {
+                    int k = m - O;
+                    if (k <= N) dy = (*tm)[k - 1];
+                }
+                float cy = y0 + sgn * dy + offy;
+                float l = cx - pw * 0.5f, r = cx + pw * 0.5f;
+                float b = cy - ph * 0.5f, t = cy + ph * 0.5f;
+                for (auto h : nearby) {
+                    if (r < h->minx - margin || l > h->maxx + margin) continue;
+                    if (h->circle) {
+                        float qx = std::clamp(h->cx, l, r), qy = std::clamp(h->cy, b, t);
+                        float ddx = qx - h->cx, ddy = qy - h->cy;
+                        float rr = h->r + margin;
+                        if (ddx * ddx + ddy * ddy < rr * rr) return false;
+                    } else if (b < h->maxy + margin && t > h->miny - margin) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+
+        if (survives(0)) return -1; // the click as it is already clears everything
+
+        int a = -1;
+        for (int d = 1; d <= W; d++) {
+            if (survives(d)) { a = d; break; }
+        }
+        if (a < 0) {
+            DBG("[InputBuffer] smart jump: no safe start within {} steps, click passed through", W);
+            return -1;
+        }
+        int b = a;
+        while (b + 1 <= W && survives(b + 1)) b++;
+        int pick = g_smartEarliest ? a : a + (b - a) / 2;
+        DBG("[InputBuffer] smart jump: delaying click {} steps (safe {}..{}, window {})", pick, a, b, W);
+        return pick;
+    }
+
     void stepPlayer(PlayerObject* p, PState& s, int idx) {
         int step = m_fields->step;
         char const* tag = idx == 0 ? "P1" : "P2";
 
         if (isGroundMode(p) && p->m_isOnGround) s.lastGroundStep = step;
+        if (idx == 0) smartObserve(p, s, step);
+
+        // Smart Jump: the held-back click goes out at the chosen tick.
+        if (s.smartFire && step >= s.smartFireAt) {
+            s.smartFire = false;
+            if (isGroundMode(p) && p->m_isOnGround) {
+                sendInput(p, true);
+                s.releaseNext = true;
+                s.releaseNextAt = step + injectHoldSteps(s);
+                s.sjFireStep = step;
+                DBG("[InputBuffer] {} SMART JUMP click at step {}", tag, step);
+                showText("SMART");
+            }
+        }
 
         // A click that came a few ticks after leaving the ground is injected
         // as if the player were still standing on it (experimental).
@@ -2150,6 +2657,20 @@ class $modify(BufferLayer, GJBaseGameLayer) {
                 s.releaseAt = s.pressStep + minHold;
                 DBG("[InputBuffer] {} MIN-HOLD delaying release: held {} < {} steps [{}]",
                     tag, heldFor, minHold, modeName(p));
+                return true;
+            }
+        }
+
+        // Smart Jump (cube): if starting the jump now would hit a hazard but a
+        // slightly later start clears it, hold the click back and fire it then.
+        if (down && g_smart && idx == 0) {
+            if (s.smartFire) return true; // one is already on its way
+            int d = smartDecide(p, s, step);
+            if (d > 0) {
+                s.held = true;
+                s.pending = false;
+                s.smartFire = true;
+                s.smartFireAt = step + 1 + d;
                 return true;
             }
         }
