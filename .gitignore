@@ -1,0 +1,22 @@
+# Build output
+build/
+build-*/
+out/
+*.geode
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+
+# Editors / IDEs
+.vs/
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
